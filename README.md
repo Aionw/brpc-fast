@@ -19,6 +19,25 @@ Control-plane and metadata services often run demanding mixed workloads: **multi
 
 `brpc-fast` bridges this gap: **Proto3 IDL + schema evolution + Apache bRPC transport**, paired with a **zero-copy, pool-backed, fixed-width binary codec and plain C++20 structs**.
 
+## Benchmarks
+
+![brpc-fast Benchmark Overview](benchmarks/assets/benchmark_overview.svg)
+
+Measured on an AMD Ryzen 7 9700X (8C/16T, Linux, GCC 16.2.1 `-O3 -DNDEBUG`, TCP loopback, [`bench_schema.proto`](benchmarks/bench_schema.proto) with `key_len=128`, `replicas_per_key=2`, `concurrency=16`). See [`benchmarks/README.md`](benchmarks/README.md) for the complete codec and E2E tables, small-RPC baselines, versions, and methodology.
+
+| Workload | `brpc-fast` | `brpc + pb` | `grpc++` (Callback) | `coro_rpc` (`struct_pack`) | `capnp_rpc` (0-copy)* |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **Codec `BatchGet(10,000)`** (reuse RT) | **607 us** (1.71 MiB) | 4.81 ms (1.30 MiB) / 3.45 ms Arena | — | 1.36 ms (1.63 MiB) | 1.36 ms (2.90 MiB) |
+| **Codec `BatchPutStart(10,000)`** (reuse RT) | **53.7 us** (24.5 GB/s) | 275 us (4.6 GB/s) | — | 171 us (7.7 GB/s) | 96.5 us (15.8 GB/s) |
+| **RPC `Ping(c=16)`** QPS / P50 / P99 | 552k / 28.6 us / 38.6 us | 553k / 28.4 us / 38.5 us | 480k / 28.4 us / 106 us | **1,692k / 9.2 us / 10.2 us** | 1,348k / 11.0 us / 29.9 us |
+| **RPC `BatchGet(1,000)`** QPS / P50 / P99 | **31.0k / 403 us / 2.07 ms** | 3.88k / 3.70 ms / 9.96 ms | 3.73k / 3.30 ms / 17.9 ms | 12.2k / 1.29 ms / 2.97 ms | 36.2k / 421 us / 880 us |
+| **RPC `BatchGet(10,000)`** QPS / P50 / P99 | **938 / 15.5 ms / 32.1 ms** | 288 / 51.3 ms / 128 ms | 256 / 44.7 ms / 301 ms | 784 / 20.2 ms / 45.6 ms | 1,361 / 11.5 ms / 16.3 ms |
+| **RPC `Mixed(80%sm+10k)`** small P99 / large QPS | **1.61 ms** / **932** | 9.07 ms / 284 | 61.2 ms / 232 | 1.68 ms / 794 | 5.89 ms / 1,622 |
+
+- **vs. `brpc + protobuf` & native `grpc++`**: **7.9×–11×** faster large-batch codec (**5.7×** vs. Protobuf Arena), **3.3×–8.3×** higher batch RPC throughput, and **5.6× / 38×** lower small-RPC P99 tail latency under mixed large-batch pressure, with zero overhead on tiny `Ping` RPCs (~31% larger wire size on nested payloads: `1.71 MiB` vs. `1.30 MiB`).
+- **vs. `coro_rpc` (`struct_pack`)**: `coro_rpc` leads on tiny RPCs (`Ping`/`GetReplica`, ~3.1× QPS) thanks to C++20 stackless coroutines and minimal framing; `brpc-fast` surpasses `coro_rpc` on medium/large batches (**2.54×** QPS on `BatchGet(1,000)`, **+20%** QPS and **30% lower P99** on `BatchGet(10,000)`) and mixed traffic while providing Proto3 schema evolution and bRPC's industrial transport stack.
+- **\*vs. `capnp_rpc`**: Cap'n Proto writes/reads wire segments in-place without materializing C++ structs (and ran across 8 manually sharded single-threaded reactors), yielding higher raw large-batch loopback QPS at the cost of **1.70×** larger wire size (`2.90 MiB`), **3.7× worse** small-RPC P99 in mixed traffic (`5.89 ms` vs. `1.61 ms`), and non-value `Builder`/`Reader` APIs.
+
 ## Architecture & Key Optimizations
 
 ### 1. Tagged Fixed-Width Wire Format with Schema Evolution

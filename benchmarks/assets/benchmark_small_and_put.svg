@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1140" height="412" viewBox="0 0 1140 412">
+<rect x="0.5" y="0.5" width="1139" height="411" rx="14" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1"/>
+<text x="28" y="34" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" font-weight="800" fill="#0F172A">Small-RPC Baseline &amp; Bulk String/Scalar Codec</text>
+<text x="28" y="53" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#64748B">Zero overhead over native bRPC on tiny RPCs; 24.5 GB/s round-trip on bulk key/uint64 batches</text>
+<rect x="26" y="70" width="534" height="316" rx="10" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+<text x="44" y="98" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14.5" font-weight="700" fill="#0F172A">E2E RPC — Ping (Small ~14B, c=16)</text>
+<text x="44" y="116" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#64748B">Pure transport &amp; scheduler ceiling (QPS, higher is better)</text>
+<line x1="174.0" y1="126" x2="174.0" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="174.0" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">0</text>
+<line x1="239.0" y1="126" x2="239.0" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="239.0" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">500k</text>
+<line x1="304.0" y1="126" x2="304.0" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="304.0" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">1.0M</text>
+<line x1="369.0" y1="126" x2="369.0" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="369.0" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">1.5M</text>
+<line x1="174" y1="126" x2="174" y2="328" stroke="#CBD5E1" stroke-width="1.2"/>
+<text x="164" y="150.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">coro_rpc (sp)</text>
+<rect x="174.0" y="136.5" width="219.9" height="20" rx="4" fill="#7C3AED"/>
+<text x="400.9" y="150.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">1.69M QPS (9.2 us)</text>
+<text x="164" y="183.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">capnp_rpc*</text>
+<rect x="174.0" y="169.5" width="175.3" height="20" rx="4" fill="#0D9488"/>
+<text x="356.3" y="183.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">1.35M QPS (11.0 us)</text>
+<text x="164" y="216.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">brpc + pb</text>
+<rect x="174.0" y="202.5" width="71.9" height="20" rx="4" fill="#64748B"/>
+<text x="252.9" y="216.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">553k QPS (28.4 us)</text>
+<rect x="34" y="231.0" width="518" height="29.0" rx="6" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+<text x="164" y="249.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#1E3A8A">brpc-fast</text>
+<rect x="174.0" y="235.5" width="71.7" height="20" rx="4" fill="#2563EB"/>
+<text x="252.7" y="249.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#1D4ED8">552k QPS (28.6 us)</text>
+<text x="164" y="282.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">brpc+att (sp)</text>
+<rect x="174.0" y="268.5" width="71.7" height="20" rx="4" fill="#0284C7"/>
+<text x="252.7" y="282.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">551k QPS (28.5 us)</text>
+<text x="164" y="315.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">grpc++ (cb)</text>
+<rect x="174.0" y="301.5" width="62.4" height="20" rx="4" fill="#EA580C"/>
+<text x="243.4" y="315.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">480k QPS (28.4 us)</text>
+<line x1="42" y1="357" x2="544" y2="357" stroke="#E2E8F0" stroke-width="1"/>
+<text x="44" y="375" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#64748B">brpc-fast matches native brpc+pb identically; bRPC hits &gt;1M QPS with single-conn multiplexing</text>
+<rect x="580" y="70" width="534" height="316" rx="10" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+<text x="598" y="98" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14.5" font-weight="700" fill="#0F172A">Codec Throughput — BatchPutStart(10,000)</text>
+<text x="598" y="116" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#64748B">10k x 128B keys + 10k uint64s (GB/s, higher is better)</text>
+<line x1="728.0" y1="126" x2="728.0" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="728.0" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">0</text>
+<line x1="772.2" y1="126" x2="772.2" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="772.2" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">5 GB/s</text>
+<line x1="816.3" y1="126" x2="816.3" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="816.3" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">10</text>
+<line x1="860.5" y1="126" x2="860.5" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="860.5" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">15</text>
+<line x1="904.6" y1="126" x2="904.6" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="904.6" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">20</text>
+<line x1="948.8" y1="126" x2="948.8" y2="328" stroke="#E2E8F0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="948.8" y="343" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#94A3B8">25</text>
+<line x1="728" y1="126" x2="728" y2="328" stroke="#CBD5E1" stroke-width="1.2"/>
+<rect x="588" y="132.0" width="518" height="29.0" rx="6" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1"/>
+<text x="718" y="150.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#1E3A8A">brpc-fast (reuse)</text>
+<rect x="728.0" y="136.5" width="216.3" height="20" rx="4" fill="#2563EB"/>
+<text x="951.3" y="150.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#1D4ED8">24.5 GB/s (53.7 us)</text>
+<text x="718" y="183.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">Cap&#x27;n Proto (0-copy)*</text>
+<rect x="728.0" y="169.5" width="139.7" height="20" rx="4" fill="#0D9488"/>
+<text x="874.7" y="183.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">15.8 GB/s (96.5 us)</text>
+<text x="718" y="216.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">struct_pack (fresh)</text>
+<rect x="728.0" y="202.5" width="67.7" height="20" rx="4" fill="#7C3AED"/>
+<text x="802.7" y="216.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">7.67 GB/s (171 us)</text>
+<text x="718" y="249.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">brpc-fast (fresh)</text>
+<rect x="728.0" y="235.5" width="43.9" height="20" rx="4" fill="#60A5FA"/>
+<text x="778.9" y="249.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">4.97 GB/s (265 us)</text>
+<text x="718" y="282.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">Protobuf (reuse)</text>
+<rect x="728.0" y="268.5" width="41.1" height="20" rx="4" fill="#64748B"/>
+<text x="776.1" y="282.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">4.65 GB/s (275 us)</text>
+<text x="718" y="315.5" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="500" fill="#334155">Protobuf (fresh)</text>
+<rect x="728.0" y="301.5" width="16.9" height="20" rx="4" fill="#94A3B8"/>
+<text x="751.9" y="315.5" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="500" fill="#1E293B">1.91 GB/s (669 us)</text>
+<line x1="596" y1="357" x2="1098" y2="357" stroke="#E2E8F0" stroke-width="1"/>
+<text x="598" y="375" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#64748B">Bulk memcpy for repeated fixed-width uint64 + capacity-reusing decode -&gt; 12.8x vs PB fresh</text>
+</svg>
