@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package brpc_fast.bench_proto;
+
+enum ReplicaStatus {
+    REPLICA_UNKNOWN = 0;
+    REPLICA_PROCESSING = 1;
+    REPLICA_COMPLETE = 2;
+}
+
+message MemoryDesc {
+    uint64 buffer_address = 1;
+    uint64 size = 2;
+    string protocol = 3;
+    string transport_endpoint = 4;
+    int32 numa_node = 5;
+    repeated string hca_names = 6;
+}
+
+message DiskDesc {
+    string file_path = 1;
+    uint64 object_size = 2;
+}
+
+message ReplicaDesc {
+    uint64 replica_id = 1;
+    ReplicaStatus status = 2;
+    oneof backend {
+        MemoryDesc memory = 3;
+        DiskDesc disk = 4;
+    }
+}
+
+message KeyReplicaResult {
+    int32 error_code = 1;
+    uint64 lease_ttl_ms = 2;
+    optional uint64 object_checksum = 3;
+    repeated ReplicaDesc replicas = 4;
+}
+
+message PingRequest {
+    uint64 client_hi = 1;
+    uint64 client_lo = 2;
+}
+
+message PingResponse {
+    uint64 view_version = 1;
+    int32 client_status = 2;
+}
+
+message GetReplicaRequest {
+    string tenant_id = 1;
+    string key = 2;
+}
+
+message GetReplicaResponse {
+    KeyReplicaResult result = 1;
+}
+
+message BatchGetReplicaRequest {
+    string tenant_id = 1;
+    repeated string keys = 2;
+}
+
+message BatchGetReplicaResponse {
+    repeated KeyReplicaResult results = 1;
+}
+
+message BatchPutStartRequest {
+    uint64 client_hi = 1;
+    uint64 client_lo = 2;
+    string tenant_id = 3;
+    repeated string keys = 4;
+    repeated uint64 slice_lengths = 5;
+    uint32 replica_num = 6;
+}
+
+message BatchPutStartResponse {
+    repeated KeyReplicaResult results = 1;
+}
+
+service BenchMasterService {
+    rpc Ping(PingRequest) returns (PingResponse);
+    rpc GetReplica(GetReplicaRequest) returns (GetReplicaResponse);
+    rpc BatchGetReplica(BatchGetReplicaRequest) returns (BatchGetReplicaResponse);
+    rpc BatchPutStart(BatchPutStartRequest) returns (BatchPutStartResponse);
+}

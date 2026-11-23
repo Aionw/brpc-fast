@@ -1,0 +1,334 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -19,6 +19,7 @@
+ project(brpc C CXX)
+ 
+ option(WITH_GLOG "With glog" OFF)
++option(WITH_LEVELDB "With leveldb" ON)
+ option(WITH_MESALINK "With MesaLink" OFF)
+ option(WITH_BORINGSSL "With BoringSSL" OFF)
+ option(DEBUG "Print debug logs" OFF)
+@@ -76,6 +77,11 @@
+     set(BRPC_WITH_GLOG 1)
+ endif()
+ 
++set(WITH_LEVELDB_VAL "0")
++if(WITH_LEVELDB)
++    set(WITH_LEVELDB_VAL "1")
++endif()
++
+ set(WITH_CPU_FREQUENCY_VAL "0")
+ if(WITH_CPU_FREQUENCY)
+     set(WITH_CPU_FREQUENCY_VAL "1")
+@@ -158,6 +164,7 @@
+ 
+ list(APPEND BRPC_COMMON_DEFINITIONS
+     BRPC_WITH_GLOG=${WITH_GLOG_VAL}
++    BRPC_WITH_LEVELDB=${WITH_LEVELDB_VAL}
+     BRPC_WITH_RDMA=${WITH_RDMA_VAL}
+     BRPC_WITH_UBRING=${WITH_UBRING_VAL}
+     BRPC_DEBUG_BTHREAD_SCHE_SAFETY=${WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL}
+@@ -171,7 +178,6 @@
+     __STDC_FORMAT_MACROS
+     __STDC_LIMIT_MACROS
+     __STDC_CONSTANT_MACROS
+-    __STRICT_ANSI__
+ )
+ 
+ if(NOT DEBUG)
+@@ -273,10 +279,12 @@
+ endif()
+ find_package(Threads REQUIRED)
+ 
+-find_path(LEVELDB_INCLUDE_PATH NAMES leveldb/db.h)
+-find_library(LEVELDB_LIB NAMES leveldb)
+-if ((NOT LEVELDB_INCLUDE_PATH) OR (NOT LEVELDB_LIB))
+-    message(FATAL_ERROR "Fail to find leveldb")
++if(WITH_LEVELDB)
++    find_path(LEVELDB_INCLUDE_PATH NAMES leveldb/db.h)
++    find_library(LEVELDB_LIB NAMES leveldb)
++    if ((NOT LEVELDB_INCLUDE_PATH) OR (NOT LEVELDB_LIB))
++        message(FATAL_ERROR "Fail to find leveldb")
++    endif()
+ endif()
+ 
+ if(WITH_SNAPPY)
+@@ -318,9 +326,11 @@
+     list(APPEND BRPC_COMMON_INCLUDE_DIRS ${RDMA_INCLUDE_PATH})
+ endif()
+ 
+-find_library(PROTOC_LIB NAMES protoc)
+-if(NOT PROTOC_LIB)
+-    message(FATAL_ERROR "Fail to find protoc lib")
++if(BUILD_BRPC_TOOLS)
++    find_library(PROTOC_LIB NAMES protoc)
++    if(NOT PROTOC_LIB)
++        message(FATAL_ERROR "Fail to find protoc lib")
++    endif()
+ endif()
+ 
+ if(WITH_BORINGSSL)
+@@ -340,18 +350,24 @@
+ list(APPEND BRPC_COMMON_INCLUDE_DIRS
+     ${GFLAGS_INCLUDE_PATH}
+     ${PROTOBUF_INCLUDE_DIRS}
+-    ${LEVELDB_INCLUDE_PATH}
+ )
++if(WITH_LEVELDB)
++    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${LEVELDB_INCLUDE_PATH})
++endif()
+ 
+ set(DYNAMIC_LIB
+     ${GFLAGS_LIBRARY}
+     ${PROTOBUF_LIBRARIES} ${protobuf_ABSL_USED_TARGETS}
+-    ${LEVELDB_LIB}
+-    ${PROTOC_LIB}
+     ${CMAKE_THREAD_LIBS_INIT}
+     ${THRIFT_LIB}
+     dl
+     ZLIB::ZLIB)
++if(WITH_LEVELDB)
++    list(APPEND DYNAMIC_LIB ${LEVELDB_LIB})
++endif()
++if(PROTOC_LIB)
++    list(APPEND DYNAMIC_LIB ${PROTOC_LIB})
++endif()
+ 
+ if(WITH_BORINGSSL)
+     list(APPEND DYNAMIC_LIB ${BORINGSSL_SSL_LIBRARY})
+@@ -375,7 +391,13 @@
+     list(APPEND DYNAMIC_LIB ${UB_LIB})
+ endif()
+ 
+-set(BRPC_PRIVATE_LIBS "-lgflags -lprotobuf -lleveldb -lprotoc -lssl -lcrypto -ldl -lz")
++set(BRPC_PRIVATE_LIBS "-lgflags -lprotobuf -lssl -lcrypto -ldl -lz")
++if(WITH_LEVELDB)
++    set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -lleveldb")
++endif()
++if(PROTOC_LIB)
++    set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -lprotoc")
++endif()
+ 
+ if(WITH_GLOG)
+     set(DYNAMIC_LIB ${GLOG_LIB} ${DYNAMIC_LIB})
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -63,13 +63,15 @@
+ 
+ # for protoc-gen-mcpack
+ set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/output/bin)
+-    
+-set(protoc_gen_mcpack_SOURCES
+-    ${PROJECT_SOURCE_DIR}/src/mcpack2pb/generator.cpp
+- )
+-    
+-add_executable(protoc-gen-mcpack ${protoc_gen_mcpack_SOURCES})
+-target_link_libraries(protoc-gen-mcpack PRIVATE brpc_common_config)
++
++if(BUILD_BRPC_TOOLS)
++    set(protoc_gen_mcpack_SOURCES
++        ${PROJECT_SOURCE_DIR}/src/mcpack2pb/generator.cpp
++     )
++
++    add_executable(protoc-gen-mcpack ${protoc_gen_mcpack_SOURCES})
++    target_link_libraries(protoc-gen-mcpack PRIVATE brpc_common_config)
++endif()
+ 
+ if(BUILD_SHARED_LIBS)
+     add_library(brpc-shared SHARED $<TARGET_OBJECTS:BUTIL_LIB> 
+@@ -86,7 +88,9 @@
+     endif()
+     SET_TARGET_PROPERTIES(brpc-shared PROPERTIES OUTPUT_NAME brpc CLEAN_DIRECT_OUTPUT 1)
+ 
+-    target_link_libraries(protoc-gen-mcpack PRIVATE brpc-shared ${DYNAMIC_LIB})
++    if(BUILD_BRPC_TOOLS)
++        target_link_libraries(protoc-gen-mcpack PRIVATE brpc-shared ${DYNAMIC_LIB})
++    endif()
+ 
+     install(TARGETS brpc-shared
+             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+@@ -94,7 +98,9 @@
+             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+             )
+ else()
+-    target_link_libraries(protoc-gen-mcpack PRIVATE brpc-static ${DYNAMIC_LIB})
++    if(BUILD_BRPC_TOOLS)
++        target_link_libraries(protoc-gen-mcpack PRIVATE brpc-static ${DYNAMIC_LIB})
++    endif()
+ endif()
+ 
+ 
+--- a/src/brpc/span.cpp
++++ b/src/brpc/span.cpp
+@@ -19,8 +19,10 @@
+ #include <netinet/in.h>
+ #include <functional>
+ #include <gflags/gflags.h>
++#if BRPC_WITH_LEVELDB
+ #include <leveldb/db.h>
+ #include <leveldb/comparator.h>
++#endif
+ #include "bthread/bthread.h"
+ #include "butil/scoped_lock.h"
+ #include "butil/thread_local.h"
+@@ -123,7 +125,9 @@
+     butil::return_object(r);
+ }
+ 
++#if BRPC_WITH_LEVELDB
+ const int64_t SPAN_DELETE_INTERVAL_US = 10000000L/*10s*/;
++#endif
+ 
+ DEFINE_string(rpcz_database_dir, "./rpc_data/rpcz",
+               "For storing requests/contexts collected by rpcz.");
+@@ -466,6 +470,7 @@
+     }
+ }
+ 
++#if BRPC_WITH_LEVELDB
+ class SpanDB : public SharedObject {
+ public:
+     leveldb::DB* id_db;
+@@ -510,10 +515,14 @@
+ // Can't use intrusive_ptr which has ctor/dtor issues.
+ static SpanDB* g_span_db = nullptr;
+ bool has_span_db() { return !!g_span_db; }
++#else
++bool has_span_db() { return false; }
++#endif
+ bvar::CollectorSpeedLimit g_span_sl = BVAR_COLLECTOR_SPEED_LIMIT_INITIALIZER;
+ static bvar::DisplaySamplingRatio s_display_sampling_ratio(
+     "rpcz_sampling_ratio", &g_span_sl);
+ 
++#if BRPC_WITH_LEVELDB
+ struct SpanEarlier {
+     bool operator()(const bvar::Collected* c1, const bvar::Collected* c2) const {
+         const SpanContainer* container1 = static_cast<const SpanContainer*>(c1);
+@@ -534,15 +543,21 @@
+     }
+ };
+ static SpanPreprocessor* g_span_prep = nullptr;
++#endif
+ 
+ bvar::CollectorSpeedLimit* Span::speed_limit() {
+     return &g_span_sl;
+ }
+ 
+ bvar::CollectorPreprocessor* Span::preprocessor() {
++#if BRPC_WITH_LEVELDB
+     return g_span_prep;
++#else
++    return nullptr;
++#endif
+ }
+ 
++#if BRPC_WITH_LEVELDB
+ static void ResetSpanDB(SpanDB* db) {
+     SpanDB* old_db = nullptr;
+     {
+@@ -584,6 +599,7 @@
+     }
+     return -1;
+ }
++#endif
+ 
+ void Span::Submit(std::shared_ptr<Span> span, int64_t cpuwide_time_us) {
+     // Submit root spans without a local parent. Server spans and root client
+@@ -594,6 +610,7 @@
+     }
+ }
+ 
++#if BRPC_WITH_LEVELDB
+ static void Span2Proto(const Span* span, RpczSpan* out) {
+     out->set_trace_id(span->trace_id());
+     out->set_span_id(span->span_id());
+@@ -889,6 +906,10 @@
+         }
+     }
+ }
++#else
++void Span::dump_to_db() {
++}
++#endif
+ 
+ // ========== SpanContainer ============
+ 
+@@ -927,6 +948,7 @@
+ // =====================================
+ 
+ int FindSpan(uint64_t trace_id, uint64_t span_id, RpczSpan* response) {
++#if BRPC_WITH_LEVELDB
+     butil::intrusive_ptr<SpanDB> db;
+     if (GetSpanDB(&db) != 0) {
+         return -1;
+@@ -945,10 +967,17 @@
+         return -1;
+     }
+     return 0;
++#else
++    (void)trace_id;
++    (void)span_id;
++    (void)response;
++    return -1;
++#endif
+ }
+ 
+ void FindSpans(uint64_t trace_id, std::deque<RpczSpan>* out) {
+     out->clear();
++#if BRPC_WITH_LEVELDB
+     butil::intrusive_ptr<SpanDB> db;
+     if (GetSpanDB(&db) != 0) {
+         return;
+@@ -976,11 +1005,15 @@
+         }
+     }
+     delete it;
++#else
++    (void)trace_id;
++#endif
+ }
+ 
+ void ListSpans(int64_t starting_realtime, size_t max_scan,
+                std::deque<BriefSpan>* out, SpanFilter* filter) {
+     out->clear();
++#if BRPC_WITH_LEVELDB
+     butil::intrusive_ptr<SpanDB> db;
+     if (GetSpanDB(&db) != 0) {
+         return;
+@@ -1015,9 +1048,15 @@
+         }
+     }
+     delete it;
++#else
++    (void)starting_realtime;
++    (void)max_scan;
++    (void)filter;
++#endif
+ }
+ 
+ void DescribeSpanDB(std::ostream& os) {
++#if BRPC_WITH_LEVELDB
+     butil::intrusive_ptr<SpanDB> db;
+     if (GetSpanDB(&db) != 0) {
+         return;
+@@ -1042,6 +1081,9 @@
+             os << '\n' << val;
+         }
+     }
++#else
++    os << "SpanDB is disabled (brpc built without leveldb)\n";
++#endif
+ }
+ 
+ } // namespace brpc
+--- a/src/butil/thread_local.h
++++ b/src/butil/thread_local.h
+@@ -61,7 +61,7 @@
+      var_name = v;                                                              \
+    }
+ 
+-#if (defined (__aarch64__) && defined (__GNUC__)) || defined(__clang__)
++#if defined(__GNUC__) || defined(__clang__)
+ // GNU compiler under aarch and Clang compiler is incorrectly caching the 
+ // address of thread_local variables across a suspend-point. The following
+ // macros used to disable the volatile thread local access optimization.

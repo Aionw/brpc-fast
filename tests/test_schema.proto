@@ -1,0 +1,408 @@
+syntax = "proto3";
+
+package brpc_fast.test;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+enum ReplicaStatus {
+    REPLICA_UNKNOWN = 0;
+    REPLICA_PROCESSING = 1;
+    REPLICA_COMPLETE = 2;
+}
+
+// Intentionally references LaterMessage before its declaration to verify
+// topological sorting in brpc_fast_codegen.
+message AllTypes {
+    enum LocalKind {
+        LOCAL_NONE = 0;
+        LOCAL_HOT = 1;
+        LOCAL_COLD = 2;
+    }
+
+    bool f_bool = 1;
+    int32 f_int32 = 2;
+    int64 f_int64 = 3;
+    uint32 f_uint32 = 4;
+    uint64 f_uint64 = 5;
+    sint32 f_sint32 = 6;
+    sint64 f_sint64 = 7;
+    fixed32 f_fixed32 = 8;
+    fixed64 f_fixed64 = 9;
+    sfixed32 f_sfixed32 = 10;
+    sfixed64 f_sfixed64 = 11;
+    float f_float = 12;
+    double f_double = 13;
+    string f_string = 14;
+    bytes f_bytes = 15;
+    ReplicaStatus f_enum = 16;
+    LocalKind f_local_enum = 17;
+
+    optional int64 opt_int64 = 18;
+    optional string opt_string = 19;
+    optional ReplicaStatus opt_enum = 20;
+
+    repeated uint64 rep_uint64 = 21;
+    repeated int32 rep_int32 = 22;
+    repeated bool rep_bool = 23;
+    repeated string rep_string = 24;
+    repeated ReplicaStatus rep_enum = 25;
+    repeated LaterMessage rep_msg = 26;
+
+    LaterMessage sub_msg = 27;
+
+    // Includes two string alternatives to test duplicate-type oneof handling.
+    oneof choice {
+        int64 choice_i64 = 28;
+        string choice_text = 29;
+        string choice_alt_text = 30;
+        LaterMessage choice_msg = 31;
+    }
+
+    map<string, int64> map_str_i64 = 32;
+    map<int32, LaterMessage> map_i32_msg = 33;
+
+    // Large field numbers (> 31) to exercise multi-byte varint tags.
+    uint64 large_field_num = 200;
+    optional string very_large_field_num = 5000;
+}
+
+message LaterMessage {
+    uint64 id = 1;
+    string label = 2;
+    repeated uint64 offsets = 3;
+}
+
+// Realistic KV metadata structures for RPC tests & benchmarks.
+message MemoryDesc {
+    uint64 buffer_address = 1;
+    uint64 size = 2;
+    string protocol = 3;
+    string transport_endpoint = 4;
+    int32 numa_node = 5;
+    repeated string hca_names = 6;
+}
+
+message DiskDesc {
+    string file_path = 1;
+    uint64 object_size = 2;
+}
+
+message ReplicaDesc {
+    uint64 replica_id = 1;
+    ReplicaStatus status = 2;
+    oneof backend {
+        MemoryDesc memory = 3;
+        DiskDesc disk = 4;
+    }
+}
+
+message KeyReplicaResult {
+    int32 error_code = 1;
+    uint64 lease_ttl_ms = 2;
+    optional uint64 object_checksum = 3;
+    repeated ReplicaDesc replicas = 4;
+}
+
+message BatchGetReplicaRequest {
+    string tenant_id = 1;
+    repeated string keys = 2;
+}
+
+message BatchGetReplicaResponse {
+    repeated KeyReplicaResult results = 1;
+}
+
+message EchoRequest {
+    string message = 1;
+    int64 seq = 2;
+    optional bytes payload = 3;
+}
+
+message EchoResponse {
+    string message = 1;
+    int64 seq = 2;
+    optional bytes payload = 3;
+}
+
+message PingRequest {
+    uint64 client_hi = 1;
+    uint64 client_lo = 2;
+}
+
+message PingResponse {
+    uint64 view_version = 1;
+    bool ok = 2;
+}
+
+// Schema v1 for forward/backward compatibility testing with test_schema_v2.proto
+message EvolutionV1 {
+    uint64 id = 1;
+    string deprecated_note = 2;
+    repeated uint64 values = 3;
+}
+
+// Comprehensive Proto3 schema evolution v1 (paired with CompatV2 in v2.proto):
+// - Cross-width scalars & repeated scalars (bool/int32/uint32/sint32/enum <-> 64-bit)
+// - Singular <-> repeated (scalar, float, double, string, message)
+// - map<K, V> <-> repeated MapEntry & map key/value width evolution
+message CompatMapEntryStrI64 {
+    string key = 1;
+    int64 value = 2;
+}
+
+message CompatMapEntryI32Msg {
+    int32 key = 1;
+    LaterMessage value = 2;
+}
+
+message CompatV1 {
+    int32 scalar_i32 = 1;
+    uint32 scalar_u32 = 2;
+    sint32 scalar_s32 = 3;
+    bool scalar_bool = 4;
+    ReplicaStatus scalar_enum = 5;
+    optional int32 opt_i32 = 6;
+
+    repeated int32 rep_i32 = 7;
+    repeated uint32 rep_u32 = 8;
+    repeated bool rep_bool = 9;
+    repeated ReplicaStatus rep_enum = 10;
+
+    int32 single_to_rep_i32 = 11;
+    repeated int32 rep_to_single_i32 = 12;
+    float single_to_rep_f32 = 13;
+    repeated double rep_to_single_f64 = 14;
+    string single_to_rep_str = 15;
+    repeated string rep_to_single_str = 16;
+    LaterMessage single_to_rep_msg = 17;
+    repeated LaterMessage rep_to_single_msg = 18;
+
+    map<string, int64> map_to_rep_entries = 19;
+    repeated CompatMapEntryI32Msg rep_entries_to_map = 20;
+    map<int32, int32> map_widen_kv = 21;
+    CompatMapEntryStrI64 single_entry_to_map = 22;
+
+    oneof evolved_oneof {
+        int32 eo_i32 = 23;
+        LaterMessage eo_msg = 24;
+    }
+}
+
+// Nested message for testing recursive submessage merge semantics.
+message MergeLeaf {
+    int64 a = 1;
+    string b = 2;
+    repeated uint64 nums = 3;
+}
+
+message MergeContainer {
+    int32 seq = 1;
+    MergeLeaf sub = 2;
+    repeated string tags = 3;
+    map<string, MergeLeaf> leaf_map = 4;
+    oneof payload {
+        MergeLeaf leaf_branch = 5;
+        string str_branch = 6;
+    }
+}
+
+// Self-recursive & mutually-recursive messages + Google Well-Known Types.
+message RecursiveNode {
+    int64 value = 1;
+    RecursiveNode next = 2;
+    oneof extra {
+        RecursiveNode alt_node = 3;
+        string note = 4;
+    }
+}
+
+message MutualA {
+    int32 id = 1;
+    MutualB b = 2;
+}
+
+message MutualB {
+    string name = 1;
+    MutualA a = 2;
+}
+
+message WithWellKnownTypes {
+    string event_id = 1;
+    google.protobuf.Timestamp created_at = 2;
+    google.protobuf.Empty marker = 3;
+    google.protobuf.Struct attributes = 4;
+}
+
+// Mutually recursive oneof & map value (tests deferred mutable_<oneof> &
+// IndirectBox map value merging).
+message MutualOneofA {
+    int32 id = 1;
+    oneof link {
+        MutualOneofB b_branch = 2;
+        string label = 3;
+    }
+    map<int32, MutualOneofB> b_map = 4;
+}
+
+message MutualOneofB {
+    string name = 1;
+    MutualOneofA a_ref = 2;
+}
+
+// Mutually recursive nested messages inside an enclosing message.
+message NestedCycleOuter {
+    message Left {
+        int32 val = 1;
+        Right right = 2;
+    }
+    message Right {
+        string tag = 1;
+        Left left = 2;
+    }
+    Left root = 1;
+}
+
+// C++ keyword as message & field name (verifies SafeIdent in qualified paths).
+message template {
+    int32 class = 1;
+}
+
+message UsesKeywordType {
+    template item = 1;
+}
+
+// Field and oneof names colliding with codegen local variables and parameters
+// (verifies `this->` qualification across all generated methods).
+message ShadowingFieldsMsg {
+    string tag = 1;
+    uint64 sz = 2;
+    string tape = 3;
+    string dst = 4;
+    int32 cur = 5;
+    int32 end = 6;
+    int32 remaining_depth = 7;
+    int32 r = 8;
+    int32 wt = 9;
+    uint64 seen_fields = 10;
+    uint32 field_number = 11;
+    oneof args {
+        string arg_text = 12;
+        int64 arg_num = 13;
+    }
+}
+
+// References nested enum of a later-declared message (singular + map value)
+// to verify TopoSortMessages emits enum-owning messages first.
+message ForwardNestedEnumUser {
+    ForwardNestedEnumOwner.Kind kind = 1;
+    map<string, ForwardNestedEnumOwner.Kind> kind_map = 2;
+}
+
+message ForwardNestedEnumOwner {
+    enum Kind {
+        KIND_UNKNOWN = 0;
+        KIND_ALPHA = 1;
+        KIND_BETA = 2;
+    }
+    int32 id = 1;
+}
+
+// Asymmetric message <-> nested-enum cycle: CycleEnumOwner holds CycleEnumUser
+// while CycleEnumUser references CycleEnumOwner.Kind.
+message CycleEnumOwner {
+    enum Kind {
+        CYCLE_NONE = 0;
+        CYCLE_ACTIVE = 1;
+    }
+    CycleEnumUser user = 1;
+}
+
+message CycleEnumUser {
+    CycleEnumOwner.Kind kind = 1;
+    string label = 2;
+}
+
+// Mutual nested-enum cycle: both messages reference each other's nested enum.
+message MutualEnumA {
+    enum Kind {
+        A_NONE = 0;
+        A_ONE = 1;
+    }
+    MutualEnumB.Kind b_kind = 1;
+}
+
+message MutualEnumB {
+    enum Kind {
+        B_NONE = 0;
+        B_TWO = 2;
+    }
+    MutualEnumA.Kind a_kind = 1;
+}
+
+// Message with > 64 regular fields (exercises DecodeLoop fallback without
+// 64-bit bitmask shift UB).
+message ManyFieldsMsg {
+    int32 f01 = 1;   int32 f02 = 2;   int32 f03 = 3;   int32 f04 = 4;
+    int32 f05 = 5;   int32 f06 = 6;   int32 f07 = 7;   int32 f08 = 8;
+    int32 f09 = 9;   int32 f10 = 10;  int32 f11 = 11;  int32 f12 = 12;
+    int32 f13 = 13;  int32 f14 = 14;  int32 f15 = 15;  int32 f16 = 16;
+    int32 f17 = 17;  int32 f18 = 18;  int32 f19 = 19;  int32 f20 = 20;
+    int32 f21 = 21;  int32 f22 = 22;  int32 f23 = 23;  int32 f24 = 24;
+    int32 f25 = 25;  int32 f26 = 26;  int32 f27 = 27;  int32 f28 = 28;
+    int32 f29 = 29;  int32 f30 = 30;  int32 f31 = 31;  int32 f32 = 32;
+    int32 f33 = 33;  int32 f34 = 34;  int32 f35 = 35;  int32 f36 = 36;
+    int32 f37 = 37;  int32 f38 = 38;  int32 f39 = 39;  int32 f40 = 40;
+    int32 f41 = 41;  int32 f42 = 42;  int32 f43 = 43;  int32 f44 = 44;
+    int32 f45 = 45;  int32 f46 = 46;  int32 f47 = 47;  int32 f48 = 48;
+    int32 f49 = 49;  int32 f50 = 50;  int32 f51 = 51;  int32 f52 = 52;
+    int32 f53 = 53;  int32 f54 = 54;  int32 f55 = 55;  int32 f56 = 56;
+    int32 f57 = 57;  int32 f58 = 58;  int32 f59 = 59;  int32 f60 = 60;
+    int32 f61 = 61;  int32 f62 = 62;  int32 f63 = 63;  int32 f64 = 64;
+    int32 f65 = 65;  int32 f66 = 66;  string f67 = 67; optional int64 f68 = 68;
+}
+
+// Official Proto3 compatibility extensions (paired with Proto3CompatExtV2 in
+// test_schema_v2.proto and IncompatiblePreserve in test_preserve.proto):
+// - plain / optional <-> single-member oneof
+// - string <-> bytes (singular, optional, repeated)
+// - fixed32 <-> sfixed32, fixed64 <-> sfixed64
+// - int64/uint64 narrowing -> int32/uint32
+// - incompatible wire types on shared field numbers
+message Proto3CompatExtV1 {
+    int64 plain_to_oneof_i64 = 1;
+    optional string opt_to_oneof_str = 2;
+    LaterMessage msg_to_oneof = 3;
+    oneof oneof_to_plain {
+        int64 otp_i64 = 4;
+    }
+    oneof oneof_to_opt {
+        string oto_str = 5;
+    }
+
+    string str_to_bytes = 6;
+    optional bytes bytes_to_str = 7;
+    repeated string rep_str_to_bytes = 8;
+
+    fixed32 f32_to_sf32 = 9;
+    sfixed64 sf64_to_f64 = 10;
+    int64 narrow_i64 = 11;
+    uint64 narrow_u64 = 12;
+
+    string incompat_str_to_i32 = 13;
+    LaterMessage incompat_msg_to_i64 = 14;
+    int64 trailing_sentinel = 15;
+}
+
+service EchoService {
+    rpc Echo(EchoRequest) returns (EchoResponse);
+    rpc BatchGetReplica(BatchGetReplicaRequest) returns (BatchGetReplicaResponse);
+    rpc UnimplementedCall(EchoRequest) returns (EchoResponse);
+    rpc SlowEcho(EchoRequest) returns (EchoResponse);
+    rpc FailCall(EchoRequest) returns (EchoResponse);
+}
+
+service HealthService {
+    rpc Ping(PingRequest) returns (PingResponse);
+}

@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package brpc_fast.test;
+
+import "test_schema.proto";
+
+// Evolved schema sharing wire field numbers with EvolutionV1:
+// - field 1 (id) kept
+// - field 2 (deprecated_note) removed
+// - field 3 (values) kept
+// - fields 10, 11, 12, 300 added (different wire types & multi-byte tag)
+message EvolutionV2 {
+    uint64 id = 1;
+    repeated uint64 values = 3;
+    optional string extra_tag = 10;
+    repeated uint64 extra_ids = 11;
+    map<string, string> extra_meta = 12;
+    int64 large_tag_field = 300;
+}
+
+// Evolved counterpart of CompatV1 exercising all Proto3 wire-compatible changes.
+message CompatV2 {
+    int64 scalar_i32 = 1;
+    uint64 scalar_u32 = 2;
+    sint64 scalar_s32 = 3;
+    int32 scalar_bool = 4;
+    int64 scalar_enum = 5;
+    optional int64 opt_i32 = 6;
+
+    repeated int64 rep_i32 = 7;
+    repeated uint64 rep_u32 = 8;
+    repeated int32 rep_bool = 9;
+    repeated int64 rep_enum = 10;
+
+    repeated int64 single_to_rep_i32 = 11;
+    optional int64 rep_to_single_i32 = 12;
+    repeated float single_to_rep_f32 = 13;
+    optional double rep_to_single_f64 = 14;
+    repeated string single_to_rep_str = 15;
+    optional string rep_to_single_str = 16;
+    repeated LaterMessage single_to_rep_msg = 17;
+    LaterMessage rep_to_single_msg = 18;
+
+    repeated CompatMapEntryStrI64 map_to_rep_entries = 19;
+    map<int64, LaterMessage> rep_entries_to_map = 20;
+    map<int64, int64> map_widen_kv = 21;
+    map<string, int64> single_entry_to_map = 22;
+
+    oneof evolved_oneof {
+        int64 eo_i32 = 23;
+        LaterMessage eo_msg = 24;
+    }
+}
+
+// Evolved counterpart of Proto3CompatExtV1.
+message Proto3CompatExtV2 {
+    oneof moved_plain_i64 {
+        int64 plain_to_oneof_i64 = 1;
+    }
+    oneof moved_opt_str {
+        string opt_to_oneof_str = 2;
+    }
+    oneof moved_msg {
+        LaterMessage msg_to_oneof = 3;
+    }
+    int64 otp_i64 = 4;
+    optional string oto_str = 5;
+
+    bytes str_to_bytes = 6;
+    optional string bytes_to_str = 7;
+    repeated bytes rep_str_to_bytes = 8;
+
+    sfixed32 f32_to_sf32 = 9;
+    fixed64 sf64_to_f64 = 10;
+    int32 narrow_i64 = 11;
+    uint32 narrow_u64 = 12;
+
+    // Intentionally incompatible wire types relative to Proto3CompatExtV1.
+    int32 incompat_str_to_i32 = 13;
+    int64 incompat_msg_to_i64 = 14;
+    int64 trailing_sentinel = 15;
+}
+
+// Container for testing unknown field preservation inside nested/repeated
+// submessages (paired with preserve::NestedPreserveV1 in test_preserve.proto).
+message NestedEvolutionV2 {
+    EvolutionV2 child = 1;
+    repeated EvolutionV2 items = 2;
+}

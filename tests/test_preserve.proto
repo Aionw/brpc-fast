@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package brpc_fast.test.preserve;
+
+// Same wire layout as EvolutionV1, compiled with PRESERVE_UNKNOWN_FIELDS to
+// verify opt-in unknown field round-trip pass-through.
+message EvolutionV1Preserve {
+    uint64 id = 1;
+    string deprecated_note = 2;
+    repeated uint64 values = 3;
+}
+
+// Nested & repeated container sharing wire layout with NestedEvolutionV2.
+message NestedPreserveV1 {
+    EvolutionV1Preserve child = 1;
+    repeated EvolutionV1Preserve items = 2;
+}
+
+// Shares field numbers 13..15 with Proto3CompatExtV1/V2 to verify unknown field
+// capture when an existing field number arrives with an incompatible wire type.
+message IncompatiblePreserve {
+    int32 incompat_str_to_i32 = 13;
+    int64 incompat_msg_to_i64 = 14;
+    int64 trailing_sentinel = 15;
+}
