@@ -164,6 +164,39 @@ bool MessageUsesSizeTape(const Descriptor* msg) {
     return false;
 }
 
+bool IsColumnarEligible(const Descriptor* msg, const CodegenOptions& opts) {
+    if (opts.preserve_unknown_fields) return false;
+    if (msg->real_oneof_decl_count() > 0) return false;
+    if (msg->field_count() < 2) return false;
+    for (int i = 0; i < msg->field_count(); ++i) {
+        const FieldDescriptor* f = msg->field(i);
+        if (f->is_repeated() || f->is_map() || IsFieldOptionalWrapped(f) ||
+            f->real_containing_oneof() != nullptr) {
+            return false;
+        }
+        switch (f->type()) {
+            case FieldDescriptor::TYPE_BOOL:
+            case FieldDescriptor::TYPE_INT32:
+            case FieldDescriptor::TYPE_UINT32:
+            case FieldDescriptor::TYPE_SINT32:
+            case FieldDescriptor::TYPE_FIXED32:
+            case FieldDescriptor::TYPE_SFIXED32:
+            case FieldDescriptor::TYPE_INT64:
+            case FieldDescriptor::TYPE_UINT64:
+            case FieldDescriptor::TYPE_SINT64:
+            case FieldDescriptor::TYPE_FIXED64:
+            case FieldDescriptor::TYPE_SFIXED64:
+            case FieldDescriptor::TYPE_FLOAT:
+            case FieldDescriptor::TYPE_DOUBLE:
+            case FieldDescriptor::TYPE_ENUM:
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
 std::string FieldResetCall(const FieldDescriptor* f) {
     return std::string(kDetailNs) + "ResetField(this->" +
            SafeIdent(std::string(f->name())) + ")";
@@ -736,7 +769,8 @@ class CodeGenerator {
         if (defer) {
             out << inner << "bool operator==(const " << cls << "&) const;\n\n";
             out << inner << "static constexpr bool kUsesSizeTape = "
-                << (MessageUsesSizeTape(msg) ? "true" : "false") << ";\n\n"
+                << (MessageUsesSizeTape(msg) ? "true" : "false") << ";\n"
+                << inner << "static constexpr bool kIsColumnarEligible = false;\n\n"
                 << inner << "void Clear();\n"
                 << inner << "size_t ComputeSize(" << kDetailNs
                 << "SizeTape& tape) const;\n"
@@ -750,6 +784,15 @@ class CodeGenerator {
                 << inner << "BRPC_FAST_NOINLINE bool DecodeLoop(" << kDetailNs
                 << "FastReader& r);\n"
                 << inner << "bool Decode(" << kDetailNs << "FastReader& r);\n"
+                << inner << "template <bool Overwrite>\n"
+                << inner
+                << "static BRPC_FAST_NOINLINE bool DecodeColumnarVec("
+                << kDetailNs << "FastReader& sub, std::vector<" << cls
+                << ">& vec);\n"
+                << inner << "static inline " << kDetailNs
+                << "CompatStatus DecodeColumnarSingular(" << kDetailNs
+                << "FastReader& sub, uint32_t count, " << cls
+                << "& target, bool already_present);\n"
                 << inner << "bool EncodeTo(::butil::IOBuf* out) const;\n"
                 << inner << "bool DecodeFrom(const ::butil::IOBuf& in);\n";
         } else {
@@ -758,6 +801,7 @@ class CodeGenerator {
             EmitClearBody(out, msg, inner, "");
             EmitEncodeBodies(out, msg, inner, "");
             EmitDecodeBodies(out, msg, inner, "");
+            EmitColumnarBodies(out, msg, inner, "");
             out << inner
                 << "bool EncodeTo(::butil::IOBuf* out) const { return "
                    "::brpc_fast::EncodeToIOBuf(*this, out); }\n"
@@ -793,6 +837,7 @@ class CodeGenerator {
         EmitClearBody(out, msg, "", qcls + "::");
         EmitEncodeBodies(out, msg, "", qcls + "::");
         EmitDecodeBodies(out, msg, "", qcls + "::");
+        EmitColumnarBodies(out, msg, "", qcls + "::");
         out << "inline bool " << qcls
             << "::EncodeTo(::butil::IOBuf* out) const { return "
                "::brpc_fast::EncodeToIOBuf(*this, out); }\n"
@@ -951,7 +996,10 @@ class CodeGenerator {
         const std::string prefix = qual.empty() ? "" : "inline ";
         if (qual.empty()) {
             out << inner << "static constexpr bool kUsesSizeTape = "
-                << (MessageUsesSizeTape(msg) ? "true" : "false") << ";\n\n";
+                << (MessageUsesSizeTape(msg) ? "true" : "false") << ";\n"
+                << inner << "static constexpr bool kIsColumnarEligible = "
+                << (IsColumnarEligible(msg, opts_) ? "true" : "false")
+                << ";\n\n";
         }
 
         // Pass 1: ComputeSize
@@ -1042,15 +1090,10 @@ class CodeGenerator {
                 continue;
             }
             const std::string fname = SafeIdent(std::string(f->name()));
-            out << inner << "    if (" << kDetailNs << "MatchConstTag<"
-                << kDetailNs << "kFieldTag<" << f->number()
-                << "u, decltype(this->" << fname << ")>>(cur, end)) {\n"
-                << inner << "        if (!" << kDetailNs
-                << "DecodeFieldContiguous(cur, end, remaining_depth, this->"
-                << fname << ")) [[unlikely]] { return false; }\n"
-                << inner << "    } else {\n"
-                << inner << "        " << FieldResetCall(f) << ";\n"
-                << inner << "    }\n";
+            out << inner << "    if (!" << kDetailNs
+                << "TryDecodeFieldContiguous<" << f->number()
+                << "u>(cur, end, remaining_depth, this->" << fname
+                << ")) [[unlikely]] { return false; }\n";
         }
         for (int i = 0; i < msg->real_oneof_decl_count(); ++i) {
             const OneofDescriptor* oneof = msg->oneof_decl(i);
@@ -1204,6 +1247,210 @@ class CodeGenerator {
                "r.RemainingDepth());\n"
             << inner << "    }\n"
             << inner << "    return DecodeLoop<true>(r);\n"
+            << inner << "}\n\n";
+    }
+
+    void EmitColumnarBodies(std::ostringstream& out, const Descriptor* msg,
+                            const std::string& inner, const std::string& qual) {
+        const std::string cls_type = qual.empty()
+                                         ? SafeIdent(std::string(msg->name()))
+                                         : QualifiedInNamespace(msg);
+        const std::string vec_prefix = qual.empty() ? "static " : "";
+        const std::string sing_prefix =
+            qual.empty() ? "static BRPC_FAST_NOINLINE " : "inline ";
+
+        if (qual.empty() && IsColumnarEligible(msg, opts_)) {
+            out << inner << "static size_t ComputeColumnarSize(const "
+                << cls_type << "* data, uint32_t count, " << kDetailNs
+                << "SizeTape& tape) {\n"
+                << inner << "    const size_t body_slot = tape.Reserve();\n"
+                << inner << "    size_t body_len = " << kDetailNs
+                << "Varint32Size(count);\n";
+            for (int i = 0; i < msg->field_count(); ++i) {
+                const FieldDescriptor* f = msg->field(i);
+                const std::string fname = SafeIdent(std::string(f->name()));
+                out << inner << "    body_len += " << kDetailNs
+                    << "SizeScalarColumn<" << f->number()
+                    << "u>(data, count, &" << cls_type << "::" << fname
+                    << ", tape);\n";
+            }
+            out << inner
+                << "    tape.Set(body_slot, static_cast<uint32_t>(body_len));\n"
+                << inner << "    return body_len;\n"
+                << inner << "}\n\n";
+
+            out << inner
+                << "static uint8_t* EncodeColumnarUnchecked(uint8_t* dst, "
+                   "const "
+                << cls_type
+                << "* data, uint32_t count, const uint32_t*& tape) "
+                   "noexcept {\n"
+                << inner << "    const uint32_t body_len = *tape++;\n"
+                << inner << "    dst = " << kDetailNs
+                << "WriteVarint32Raw(dst, body_len);\n"
+                << inner << "    dst = " << kDetailNs
+                << "WriteVarint32Raw(dst, count);\n";
+            for (int i = 0; i < msg->field_count(); ++i) {
+                const FieldDescriptor* f = msg->field(i);
+                const std::string fname = SafeIdent(std::string(f->name()));
+                out << inner << "    dst = " << kDetailNs
+                    << "EncodeScalarColumnUnchecked<" << f->number()
+                    << "u>(dst, data, count, &" << cls_type << "::" << fname
+                    << ", tape);\n";
+            }
+            out << inner << "    return dst;\n" << inner << "}\n\n";
+        }
+
+        int regular_field_count = 0;
+        for (int i = 0; i < msg->field_count(); ++i) {
+            if (msg->field(i)->real_containing_oneof() == nullptr) {
+                ++regular_field_count;
+            }
+        }
+        const bool can_track_seen = regular_field_count <= 64;
+
+        out << inner << "template <bool Overwrite>\n"
+            << inner << vec_prefix << "BRPC_FAST_NOINLINE bool " << qual
+            << "DecodeColumnarVec(" << kDetailNs
+            << "FastReader& sub, std::vector<" << cls_type << ">& vec) {\n"
+            << inner << "    uint32_t count = 0;\n"
+            << inner << "    if (!sub.ReadVarint32(count)) { return false; }\n"
+            << inner << "    if (static_cast<uint64_t>(count) * sizeof("
+            << cls_type << ") > " << kDetailNs
+            << "kMaxExpandedSeqBytes) { return false; }\n"
+            << inner << "    const size_t existing = vec.size();\n"
+            << inner << "    const size_t base = Overwrite ? 0u : existing;\n"
+            << inner
+            << "    const size_t reuse_end = Overwrite ? (count < existing ? "
+               "count : existing) : base;\n"
+            << inner << "    vec.resize(base + count);\n";
+
+        if (!can_track_seen || msg->real_oneof_decl_count() > 0 ||
+            opts_.preserve_unknown_fields) {
+            out << inner << "    if constexpr (Overwrite) {\n"
+                << inner << "        if (reuse_end > base) {\n"
+                << inner
+                << "            for (size_t i = base; i < reuse_end; ++i) {\n";
+            if (!can_track_seen) {
+                out << inner << "                vec[i].Clear();\n";
+            } else {
+                for (int i = 0; i < msg->real_oneof_decl_count(); ++i) {
+                    out << inner << "                vec[i]."
+                        << SafeIdent(std::string(msg->oneof_decl(i)->name()))
+                        << ".template emplace<0>();\n";
+                }
+                if (opts_.preserve_unknown_fields) {
+                    out << inner
+                        << "                vec[i]._unknown_fields.Clear();\n";
+                }
+            }
+            out << inner << "            }\n"
+                << inner << "        }\n"
+                << inner << "    }\n";
+        }
+
+        out << inner << "    uint64_t seen_cols = 0;\n"
+            << inner << "    (void)seen_cols;\n"
+            << inner << "    while (!sub.Eof()) {\n"
+            << inner << "        uint32_t tag = 0;\n"
+            << inner << "        if (!sub.ReadTag(tag)) { return false; }\n"
+            << inner << "        const uint32_t field_number = " << kDetailNs
+            << "TagFieldNumber(tag);\n"
+            << inner << "        const " << kDetailNs
+            << "WireType wt = " << kDetailNs << "TagWireType(tag);\n"
+            << inner << "        switch (field_number) {\n"
+            << inner << "            case 0u:\n"
+            << inner << "                return false;\n";
+        int regular_bit = 0;
+        for (int i = 0; i < msg->field_count(); ++i) {
+            const FieldDescriptor* f = msg->field(i);
+            out << inner << "            case " << f->number() << "u:\n";
+            if (const OneofDescriptor* oneof = f->real_containing_oneof()) {
+                out << inner << "                if (!" << kDetailNs
+                    << "DecodeColumnIntoOneof<" << (f->index_in_oneof() + 1)
+                    << ">(sub, wt, vec, base, count, &" << cls_type << "::"
+                    << SafeIdent(std::string(oneof->name()))
+                    << ")) { return false; }\n";
+            } else {
+                const int bit_idx = can_track_seen ? regular_bit++ : -1;
+                out << inner << "                if (!" << kDetailNs
+                    << "DecodeColumnIntoField(sub, wt, vec, base, count, &"
+                    << cls_type << "::" << SafeIdent(std::string(f->name()))
+                    << ", seen_cols, " << bit_idx << ")) { return false; }\n";
+            }
+            out << inner << "                break;\n";
+        }
+        out << inner << "            default:\n"
+            << inner
+            << "                if (!sub.SkipUnknownField(wt)) { return "
+               "false; }\n"
+            << inner << "                break;\n"
+            << inner << "        }\n"
+            << inner << "    }\n";
+
+        if (can_track_seen && regular_field_count > 0) {
+            out << inner << "    if constexpr (Overwrite) {\n"
+                << inner << "        if (reuse_end > base) {\n";
+            regular_bit = 0;
+            for (int i = 0; i < msg->field_count(); ++i) {
+                const FieldDescriptor* f = msg->field(i);
+                if (f->real_containing_oneof() != nullptr) continue;
+                const int bit_idx = regular_bit++;
+                const std::string fname = SafeIdent(std::string(f->name()));
+                out << inner << "            if ((seen_cols & (uint64_t{1} << "
+                    << bit_idx << ")) == 0) {\n"
+                    << inner
+                    << "                for (size_t i = base; i < reuse_end; "
+                       "++i) { "
+                    << kDetailNs << "ResetField(vec[i]." << fname << "); }\n"
+                    << inner << "            }\n";
+            }
+            out << inner << "        }\n" << inner << "    }\n";
+        }
+        out << inner << "    return true;\n" << inner << "}\n\n";
+
+        out << inner << sing_prefix << kDetailNs
+            << "CompatStatus " << qual << "DecodeColumnarSingular(" << kDetailNs
+            << "FastReader& sub, uint32_t count, " << cls_type
+            << "& target, bool already_present) {\n"
+            << inner << "    if (!already_present) { target.Clear(); }\n"
+            << inner << "    while (!sub.Eof()) {\n"
+            << inner << "        uint32_t tag = 0;\n"
+            << inner << "        if (!sub.ReadTag(tag)) { return " << kDetailNs
+            << "CompatStatus::kError; }\n"
+            << inner << "        const uint32_t field_number = " << kDetailNs
+            << "TagFieldNumber(tag);\n"
+            << inner << "        const " << kDetailNs
+            << "WireType wt = " << kDetailNs << "TagWireType(tag);\n"
+            << inner << "        switch (field_number) {\n"
+            << inner << "            case 0u:\n"
+            << inner << "                return " << kDetailNs
+            << "CompatStatus::kError;\n";
+        for (int i = 0; i < msg->field_count(); ++i) {
+            const FieldDescriptor* f = msg->field(i);
+            out << inner << "            case " << f->number() << "u:\n";
+            if (const OneofDescriptor* oneof = f->real_containing_oneof()) {
+                out << inner << "                if (!" << kDetailNs
+                    << "DecodeColumnIntoSingularOneof<"
+                    << (f->index_in_oneof() + 1) << ">(sub, wt, count, target."
+                    << SafeIdent(std::string(oneof->name())) << ")) { return "
+                    << kDetailNs << "CompatStatus::kError; }\n";
+            } else {
+                out << inner << "                if (!" << kDetailNs
+                    << "DecodeColumnIntoSingularField(sub, wt, count, target."
+                    << SafeIdent(std::string(f->name())) << ")) { return "
+                    << kDetailNs << "CompatStatus::kError; }\n";
+            }
+            out << inner << "                break;\n";
+        }
+        out << inner << "            default:\n"
+            << inner << "                if (!sub.SkipUnknownField(wt)) "
+            << "{ return " << kDetailNs << "CompatStatus::kError; }\n"
+            << inner << "                break;\n"
+            << inner << "        }\n"
+            << inner << "    }\n"
+            << inner << "    return " << kDetailNs
+            << "CompatStatus::kDecoded;\n"
             << inner << "}\n\n";
     }
 

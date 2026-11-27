@@ -40,11 +40,11 @@ Measured on an AMD Ryzen 7 9700X (8C/16T, Linux, GCC 16.2.1 `-O3 -DNDEBUG`, TCP 
 
 ## Architecture & Key Optimizations
 
-### 1. Tagged Fixed-Width Wire Format with Schema Evolution
-- Uses a compact 3-bit wire type tag (`kFixed1`, `kFixed4`, `kFixed8`, `kBytes`, `kPacked1`, `kPacked4`, `kPacked8`, `kList`) supporting Protobuf field numbers up to `2^29 - 1` (1-byte tags for fields 1–15, 2-byte tags for 16–2047).
-- Encodes integers, floats, doubles, and enums as fixed-width little-endian values—eliminating per-scalar varint branching and allowing bulk `memcpy` for `repeated` 4-byte/8-byte scalars and enums.
-- Encodes `repeated` strings/messages and `map` fields with a `kList` envelope (`body_len`, `count`, elements...) so decoders `reserve(count)` upfront in one allocation and can skip any unknown field in O(1).
-- Supports Proto3 schema evolution (`detail/schema_compat.h`): forward/backward unknown-field skipping, opt-in unknown-field pass-through (`PRESERVE_UNKNOWN_FIELDS`), cross-width scalar conversion, singular ↔ repeated merging, and `map<K, V>` ↔ repeated `MapEntry` compatibility.
+### 1. Tagged Fixed-Width Wire Format with Extensible `SeqKind` Containers
+- Uses a compact 3-bit wire type tag (`kFixed1`, `kSigned4`, `kUnsigned4`, `kInt8`, `kFloat4`, `kFloat8`, `kBytes`, `kSeq`) supporting Protobuf field numbers up to `2^29 - 1` (1-byte tags for fields 1–15, 2-byte tags for 16–2047).
+- Separates signed 32-bit (`kSigned4`), unsigned 32-bit (`kUnsigned4`), 64-bit integer (`kInt8`), and IEEE-754 floating-point (`kFloat4`, `kFloat8`) wire types—giving exact Proto3 sign/zero-extension semantics across 32↔64-bit integer evolution (`int32(-1) → uint64` sign-extends to `UINT64_MAX`, `uint32(0xFFFFFFFF) → int64` zero-extends to `+4294967295`) and strictly isolating `float`/`double` from integers.
+- Encodes all `repeated` and `map` fields under `kSeq` (`uint8 SeqKind`, `varint32 body_len`, payload), enabling O(1) unknown-field / unknown-subtype skipping, bulk `memcpy` for packed scalars, bit-packed `repeated bool` (`kBitBool`, 8× smaller), constant-array compression (`kConst*`), and automatic Structure-of-Arrays columnar encoding (`kColumnar`) with zero-column omission and narrow-integer packing for flat scalar-only repeated messages.
+- Supports Proto3 schema evolution (`detail/schema_compat.h`): forward/backward unknown-field skipping, opt-in unknown-field pass-through (`PRESERVE_UNKNOWN_FIELDS`), cross-width scalar conversion, singular ↔ repeated merging (including columnar → singular), and `map<K, V>` ↔ repeated `MapEntry` compatibility.
 
 ### 2. Two-Pass Size-Tape + Zero-Copy Slab Encoding
 - **Pass 1 (`ComputeSize`)** computes exact byte lengths into a pooled pre-order `SizeTape` (`butil::ObjectPool`).
@@ -182,8 +182,8 @@ See [`benchmarks/README.md`](benchmarks/README.md) for benchmark flags and CSV e
 - **Wire compatibility**: `brpc-fast` uses its own tagged binary wire format over bRPC's `baidu_std` protocol. It is **not** wire-compatible with standard Protobuf wire encoding; both client and server must use `brpc-fast`.
 - **Proto3 unary RPCs only**: `brpc_fast_codegen` enforces `syntax = "proto3"` (proto2 files are rejected) and unary RPC methods (`stream` methods are rejected at codegen time).
 - **Server options**: `FastServer` owns the `baidu_master_service` dispatch hook and rejects caller-supplied `options.baidu_master_service` and `options.interceptor` (bRPC's `baidu_master_service` path bypasses `Server::AcceptRequest()`).
-- **Limits**: Matches Protobuf's 2 GiB − 1 (`INT32_MAX`) maximum encoded message size and enforces a default max nesting depth of 64.
-- **Schema-evolution edge cases**: Because `kFixed4`/`kFixed8` wire tags do not carry signedness or float-vs-int distinctions, cross-width integer widening/narrowing follows the destination type's signedness, and changing a field between `float`/`double` and integer types reinterprets raw IEEE-754 bits rather than skipping the field.
+- **Limits**: Matches Protobuf's 2 GiB − 1 (`INT32_MAX`) maximum encoded message size, enforces a default max nesting depth of 64, and caps compressed/columnar container expansion at 256 MiB per sequence to prevent DoS from crafted tiny packets.
+- **Schema-evolution notes**: `kSigned4`/`kUnsigned4`/`kInt8` preserve exact Proto3 signedness across 32↔64-bit conversions, and `kFloat4`/`kFloat8` are strictly isolated from integer wire types. Because `sint32`/`sfixed32` share `kSigned4`, `fixed32` shares `kUnsigned4`, and `sint64`/`fixed64`/`sfixed64` share `kInt8`, changing between fixed/zigzag/regular integers of the same width is accepted by `brpc-fast` (more permissive than standard Protobuf); `string` fields are also not UTF-8 validated on decode.
 - **Coroutine lifetime & cancellation contract**: Once a coroutine suspends on `co_await RpcFuture`, destroying the suspended coroutine frame before resumption is undefined behavior (guarded by a debug assert). `RpcFuture::Cancel()` is not thread-safe; to cancel an in-flight `co_await` from another thread, save `call_id()` before `co_await`, call `brpc::StartCancel(saved_call_id)`, and let the coroutine resume with an error result.
 
 ## License

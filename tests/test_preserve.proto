@@ -23,3 +23,13 @@ message IncompatiblePreserve {
     int64 incompat_msg_to_i64 = 14;
     int64 trailing_sentinel = 15;
 }
+
+// Shares field numbers with WireV2CompatV1 to verify float/int & repeated
+// float/int mismatches are preserved verbatim in _unknown_fields.
+message WireV2IncompatPreserve {
+    int32 f32_to_i32 = 6;
+    int64 f64_to_i64 = 8;
+    repeated int32 rep_f32_to_i32 = 11;
+    repeated int64 rep_f64_to_i64 = 12;
+    int64 sentinel = 15;
+}

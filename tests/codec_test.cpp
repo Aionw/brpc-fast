@@ -1521,5 +1521,479 @@ TEST(BrpcFastCodecTest, ShadowingFieldNamesWktCoexistenceAndMovedIndirectBox) {
     }
 }
 
+TEST(BrpcFastCodecTest, WireV2ExactSignednessAndFloatIntIsolation) {
+    auto make_chunked = [](const std::string& flat, size_t chunk) {
+        butil::IOBuf out;
+        for (size_t off = 0; off < flat.size(); off += chunk) {
+            size_t n = std::min(chunk, flat.size() - off);
+            char* seg = new char[n];
+            std::memcpy(seg, flat.data() + off, n);
+            out.append_user_data(
+                seg, n, [](void* p) { delete[] static_cast<char*>(p); });
+        }
+        return out;
+    };
+
+    // Direction 1: WireV2CompatV1 -> WireV2CompatV2
+    WireV2CompatV1 v1;
+    v1.u32_to_i64 = 0xFFFFFFFFu;
+    v1.i32_to_u64 = -1;
+    v1.enum_to_u64 = static_cast<ReplicaStatus>(-7);
+    v1.rep_u32_to_i64 = {0u, 0x80000000u, 0xFFFFFFFFu};
+    v1.rep_i32_to_u64 = {-1, std::numeric_limits<int32_t>::min(), 42};
+
+    v1.f32_to_i32 = 3.5f;
+    v1.f32_to_i64 = -2.25f;
+    v1.f64_to_i64 = 6.25;
+    v1.i32_to_f32 = 12345;
+    v1.i64_to_f64 = -9876543210LL;
+    v1.rep_f32_to_i32 = {1.0f, 2.5f, -3.5f};
+    v1.rep_f64_to_i64 = {10.5, -20.25};
+    v1.sentinel = 987654321LL;
+
+    butil::IOBuf v1_buf;
+    ASSERT_TRUE(v1.EncodeTo(&v1_buf));
+
+    for (bool fragmented : {false, true}) {
+        butil::IOBuf in =
+            fragmented ? make_chunked(v1_buf.to_string(), 3) : v1_buf;
+        WireV2CompatV2 v2;
+        // Pre-populate stale values to confirm incompatible fields reset.
+        v2.f32_to_i32 = 999;
+        v2.f32_to_i64 = 999;
+        v2.f64_to_i64 = 999;
+        v2.i32_to_f32 = 9.0f;
+        v2.i64_to_f64 = 9.0;
+        v2.rep_f32_to_i32 = {1, 2};
+        v2.rep_f64_to_i64 = {3, 4};
+        ASSERT_TRUE(v2.DecodeFrom(in)) << "fragmented=" << fragmented;
+
+        // Exact PB signedness on 32 -> 64 cross-signedness widening!
+        EXPECT_EQ(v2.u32_to_i64, 4294967295LL);
+        EXPECT_EQ(v2.i32_to_u64, std::numeric_limits<uint64_t>::max());
+        EXPECT_EQ(v2.enum_to_u64, static_cast<uint64_t>(int64_t{-7}));
+        EXPECT_EQ(v2.rep_u32_to_i64,
+                  (std::vector<int64_t>{0LL, 2147483648LL, 4294967295LL}));
+        EXPECT_EQ(
+            v2.rep_i32_to_u64,
+            (std::vector<uint64_t>{
+                std::numeric_limits<uint64_t>::max(),
+                static_cast<uint64_t>(
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::min())),
+                42ULL}));
+
+        // Float/double <-> integer mismatches MUST be skipped, never bit-cast!
+        EXPECT_EQ(v2.f32_to_i32, 0);
+        EXPECT_EQ(v2.f32_to_i64, 0);
+        EXPECT_EQ(v2.f64_to_i64, 0);
+        EXPECT_EQ(v2.i32_to_f32, 0.0f);
+        EXPECT_EQ(v2.i64_to_f64, 0.0);
+        EXPECT_TRUE(v2.rep_f32_to_i32.empty());
+        EXPECT_TRUE(v2.rep_f64_to_i64.empty());
+        EXPECT_EQ(v2.sentinel, 987654321LL);
+    }
+
+    // Also verify kConstS4 / kConstU4 cross-signedness widening!
+    {
+        WireV2CompatV1 c1;
+        c1.rep_u32_to_i64.assign(32, 0xFFFFFFFFu);
+        c1.rep_i32_to_u64.assign(32, -1);
+        c1.rep_f32_to_i32.assign(32, 1.5f);
+        c1.rep_f64_to_i64.assign(32, -2.5);
+        c1.sentinel = 77;
+        butil::IOBuf cbuf;
+        ASSERT_TRUE(c1.EncodeTo(&cbuf));
+        // Const-encoded 32-element arrays must be tiny.
+        EXPECT_LT(cbuf.size(), 80u);
+
+        WireV2CompatV2 c2;
+        ASSERT_TRUE(c2.DecodeFrom(cbuf));
+        EXPECT_EQ(c2.rep_u32_to_i64, std::vector<int64_t>(32, 4294967295LL));
+        EXPECT_EQ(c2.rep_i32_to_u64,
+                  std::vector<uint64_t>(32, std::numeric_limits<uint64_t>::max()));
+        EXPECT_TRUE(c2.rep_f32_to_i32.empty());
+        EXPECT_TRUE(c2.rep_f64_to_i64.empty());
+        EXPECT_EQ(c2.sentinel, 77);
+    }
+
+    // Float/int & repeated float/int mismatches must be preserved verbatim when
+    // PRESERVE_UNKNOWN_FIELDS is enabled!
+    {
+        WireV2CompatV1 src;
+        src.f32_to_i32 = 1.25f;
+        src.f64_to_i64 = -9.5;
+        src.rep_f32_to_i32 = {0.5f, 1.5f, 2.5f};
+        src.rep_f64_to_i64 = {3.25, 4.75};
+        src.sentinel = 555;
+        butil::IOBuf buf;
+        ASSERT_TRUE(src.EncodeTo(&buf));
+
+        for (bool fragmented : {false, true}) {
+            butil::IOBuf in =
+                fragmented ? make_chunked(buf.to_string(), 3) : buf;
+            preserve::WireV2IncompatPreserve mid;
+            ASSERT_TRUE(mid.DecodeFrom(in));
+            EXPECT_EQ(mid.f32_to_i32, 0);
+            EXPECT_EQ(mid.f64_to_i64, 0);
+            EXPECT_TRUE(mid.rep_f32_to_i32.empty());
+            EXPECT_TRUE(mid.rep_f64_to_i64.empty());
+            EXPECT_EQ(mid.sentinel, 555);
+            EXPECT_FALSE(mid._unknown_fields.Empty());
+
+            butil::IOBuf reencoded;
+            ASSERT_TRUE(mid.EncodeTo(&reencoded));
+            WireV2CompatV1 rt;
+            ASSERT_TRUE(rt.DecodeFrom(reencoded));
+            EXPECT_EQ(rt, src);
+        }
+    }
+}
+
+TEST(BrpcFastCodecTest, BitPackedBoolConstVectorsAndUnknownSeqKind) {
+    auto make_chunked = [](const std::string& flat, size_t chunk) {
+        butil::IOBuf out;
+        for (size_t off = 0; off < flat.size(); off += chunk) {
+            size_t n = std::min(chunk, flat.size() - off);
+            char* seg = new char[n];
+            std::memcpy(seg, flat.data() + off, n);
+            out.append_user_data(
+                seg, n, [](void* p) { delete[] static_cast<char*>(p); });
+        }
+        return out;
+    };
+
+    // 1. Bit-packed bool edge lengths: 0, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65,
+    //    1000
+    for (size_t n : {size_t{0}, size_t{1}, size_t{7}, size_t{8}, size_t{9},
+                     size_t{15}, size_t{16}, size_t{17}, size_t{63}, size_t{64},
+                     size_t{65}, size_t{1000}}) {
+        SeqOptMsg src;
+        src.bits.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            src.bits[i] = ((i * 37 + 3) % 5) < 2;
+        }
+        src.trailing = static_cast<int64_t>(n);
+
+        butil::IOBuf buf;
+        ASSERT_TRUE(src.EncodeTo(&buf));
+        if (n == 1000) {
+            // 1000 bools bit-packed should take ~129 bytes (8x smaller than
+            // 1000 bytes).
+            EXPECT_LT(buf.size(), 150u);
+        }
+
+        for (bool fragmented : {false, true}) {
+            butil::IOBuf in =
+                fragmented ? make_chunked(buf.to_string(), 3) : buf;
+            SeqOptMsg dst;
+            dst.bits = {true, true, true};
+            ASSERT_TRUE(dst.DecodeFrom(in))
+                << "n=" << n << " fragmented=" << fragmented;
+            EXPECT_EQ(dst, src) << "n=" << n << " fragmented=" << fragmented;
+        }
+    }
+
+    // 2. Constant vector compression (including -0.0f / -0.0 sign preservation)
+    {
+        SeqOptMsg src;
+        src.bits.assign(500, true);
+        src.const_i32.assign(500, -42);
+        src.const_u32.assign(500, 0xDEADBEEFu);
+        src.const_i64.assign(500, -9876543210123LL);
+        src.const_u64.assign(500, 0xCAFEBABE12345678ULL);
+        src.const_f32.assign(500, -0.0f);
+        src.const_f64.assign(500, -0.0);
+        src.const_enum.assign(500, ReplicaStatus::REPLICA_COMPLETE);
+        src.trailing = 123456;
+
+        butil::IOBuf buf;
+        ASSERT_TRUE(src.EncodeTo(&buf));
+        // 8 arrays of 500 elements each (~20 KB uncompressed) compress to < 120
+        // bytes!
+        EXPECT_LT(buf.size(), 120u);
+
+        for (bool fragmented : {false, true}) {
+            butil::IOBuf in =
+                fragmented ? make_chunked(buf.to_string(), 3) : buf;
+            SeqOptMsg dst;
+            ASSERT_TRUE(dst.DecodeFrom(in)) << "fragmented=" << fragmented;
+            EXPECT_EQ(dst, src) << "fragmented=" << fragmented;
+            ASSERT_EQ(dst.const_f32.size(), 500u);
+            EXPECT_TRUE(std::signbit(dst.const_f32[0]));
+            EXPECT_TRUE(std::signbit(dst.const_f32[499]));
+            ASSERT_EQ(dst.const_f64.size(), 500u);
+            EXPECT_TRUE(std::signbit(dst.const_f64[0]));
+        }
+    }
+
+    // 3. Mixed +0.0f and -0.0f must NOT be folded into kConstF4!
+    {
+        SeqOptMsg src;
+        src.const_f32.assign(64, 0.0f);
+        src.const_f32[33] = -0.0f;
+        butil::IOBuf buf;
+        ASSERT_TRUE(src.EncodeTo(&buf));
+        SeqOptMsg dst;
+        ASSERT_TRUE(dst.DecodeFrom(buf));
+        ASSERT_EQ(dst.const_f32.size(), 64u);
+        EXPECT_FALSE(std::signbit(dst.const_f32[0]));
+        EXPECT_TRUE(std::signbit(dst.const_f32[33]));
+    }
+
+    // 4. Crafted oversized kConstI8 count must be rejected cleanly without OOM.
+    {
+        std::string bad;
+        // field 4 (const_i64), WireType::kSeq (7) -> tag = (4<<3)|7 = 39
+        bad.push_back(static_cast<char>(39));
+        // SeqKind::kConstI8 (11)
+        bad.push_back(static_cast<char>(detail::SeqKind::kConstI8));
+        // body_len = 5 (varint32 count = 0x7FFFFFFF) + 8 (uint64 value) = 13
+        bad.push_back(static_cast<char>(13));
+        // count = 0x7FFFFFFF (2 billion * 8B = 16 GiB > kMaxExpandedSeqBytes)
+        bad.push_back(static_cast<char>(0xFF));
+        bad.push_back(static_cast<char>(0xFF));
+        bad.push_back(static_cast<char>(0xFF));
+        bad.push_back(static_cast<char>(0xFF));
+        bad.push_back(static_cast<char>(0x07));
+        // 8-byte value = 1
+        bad.append(8, '\0');
+
+        butil::IOBuf buf;
+        buf.append(bad);
+        SeqOptMsg dst;
+        EXPECT_FALSE(dst.DecodeFrom(buf));
+        EXPECT_EQ(dst, SeqOptMsg{});
+    }
+
+    // 5. Unknown future SeqKind (e.g. 250) on a known field or unknown field
+    //    must be skipped in O(1) and preserved verbatim when
+    //    PRESERVE_UNKNOWN_FIELDS is enabled.
+    {
+        std::string wire;
+        // Unknown future SeqKind=250 on field 11 (known repeated int32 in
+        // WireV2IncompatPreserve)
+        wire.push_back(static_cast<char>((11u << 3) | 7u));
+        wire.push_back(static_cast<char>(250u));
+        wire.push_back(static_cast<char>(5u));  // body_len = 5
+        wire.append("HELLO");
+        // Valid sentinel field 15 (int64, WireType::kInt8=3)
+        wire.push_back(static_cast<char>((15u << 3) | 3u));
+        uint64_t sv = 424242ULL;
+        wire.append(reinterpret_cast<const char*>(&sv), 8);
+
+        butil::IOBuf buf;
+        buf.append(wire);
+        preserve::WireV2IncompatPreserve p;
+        ASSERT_TRUE(p.DecodeFrom(buf));
+        EXPECT_TRUE(p.rep_f32_to_i32.empty());
+        EXPECT_EQ(p.sentinel, 424242LL);
+        EXPECT_FALSE(p._unknown_fields.Empty());
+
+        butil::IOBuf reencoded;
+        ASSERT_TRUE(p.EncodeTo(&reencoded));
+        // Re-decoding into non-preserve schema must still skip cleanly and read
+        // sentinel.
+        WireV2CompatV2 v2;
+        ASSERT_TRUE(v2.DecodeFrom(reencoded));
+        EXPECT_TRUE(v2.rep_f32_to_i32.empty());
+        EXPECT_EQ(v2.sentinel, 424242LL);
+    }
+}
+
+TEST(BrpcFastCodecTest, ColumnarRoundTripCompressionAndSchemaEvolution) {
+    static_assert(ColumnarItemV1::kIsColumnarEligible);
+    static_assert(!ColumnarItemV2::kIsColumnarEligible);
+    static_assert(ScalarMapEntryV1::kIsColumnarEligible);
+    static_assert(BoolMapEntryV1::kIsColumnarEligible);
+
+    auto make_chunked = [](const std::string& flat, size_t chunk) {
+        butil::IOBuf out;
+        for (size_t off = 0; off < flat.size(); off += chunk) {
+            size_t n = std::min(chunk, flat.size() - off);
+            char* seg = new char[n];
+            std::memcpy(seg, flat.data() + off, n);
+            out.append_user_data(
+                seg, n, [](void* p) { delete[] static_cast<char*>(p); });
+        }
+        return out;
+    };
+
+    auto make_item = [](size_t i) {
+        ColumnarItemV1 it;
+        it.replica_id = 1000ULL + i;                  // fits uint16 -> NarrowU16
+        it.status = ReplicaStatus::REPLICA_COMPLETE;  // constant -> kConstS4
+        it.buffer_address = 0x7f0000000000ULL + i * 4096ULL;  // native 64-bit
+        it.size = 1048576ULL;                         // constant -> kConstI8
+        it.endpoint_idx =
+            (i == 0) ? 0xFFFFFFFFu : static_cast<uint32_t>(i % 16);
+        it.protocol_idx = 0;                          // all zero -> omitted!
+        it.signed_delta = static_cast<int32_t>(i) - 10;  // signed narrow I8
+        it.signed_big = (i % 2 == 0) ? -50000LL : 50000LL;  // fits int32 -> S4
+        it.pinned = (i % 3 == 0);                     // kBitBool
+        it.score = (i == 1) ? -0.0f : static_cast<float>(i) * 0.5f;
+        it.weight = 2.5;                              // constant -> kConstF8
+        it.moved_to_opt = (i % 2 == 0) ? 0 : static_cast<int32_t>(i);
+        it.moved_to_oneof_a = (i % 2 == 0) ? static_cast<int32_t>(i + 1) : 0;
+        it.moved_to_oneof_b = (i % 2 == 1) ? static_cast<int32_t>(i + 100) : 0;
+        it.moved_to_rep = (i % 3 == 0) ? 0 : static_cast<int32_t>(i * 10);
+        it.incompat_f32_to_i32 = 3.25f;
+        it.removed_col = static_cast<int32_t>(i * 7);
+        return it;
+    };
+
+    // 1. Round-trip for both small (< 8, row-wise) and large (>= 8, columnar)
+    for (size_t count : {size_t{3}, size_t{8}, size_t{64}}) {
+        ColumnarBatchV1 src;
+        src.batch_id = 42;
+        src.items.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            src.items.push_back(make_item(i));
+        }
+
+        butil::IOBuf buf;
+        ASSERT_TRUE(src.EncodeTo(&buf));
+        if (count == 64) {
+            // 64 items * 17 fields row-wise would be > 5 KB; columnar
+            // compresses omitted/const/narrow columns dramatically.
+            EXPECT_LT(buf.size(), 2200u);
+        }
+
+        for (bool fragmented : {false, true}) {
+            butil::IOBuf in =
+                fragmented ? make_chunked(buf.to_string(), 7) : buf;
+            ColumnarBatchV1 dst;
+            // Pre-populate stale values to test overwrite reuse (including
+            // omitted zero column protocol_idx).
+            dst.items.resize(count + 5);
+            for (auto& s : dst.items) {
+                s.protocol_idx = 999;
+                s.pinned = true;
+            }
+            ASSERT_TRUE(dst.DecodeFrom(in))
+                << "count=" << count << " fragmented=" << fragmented;
+            EXPECT_EQ(dst, src)
+                << "count=" << count << " fragmented=" << fragmented;
+            if (count >= 2) {
+                EXPECT_TRUE(std::signbit(dst.items[1].score));
+            }
+        }
+    }
+
+    // 2. Schema evolution: V1 columnar (>= 8 items) -> V2 non-columnar message,
+    //    plus repeated columnar -> singular merge, plus columnar repeated
+    //    MapEntry -> map<int64, uint64> and map<bool, bool>.
+    {
+        ColumnarBatchV1 v1;
+        v1.batch_id = 7;
+        for (size_t i = 0; i < 16; ++i) {
+            v1.items.push_back(make_item(i));
+        }
+        // 10 items for repeated -> singular merge (item 9 has moved_to_opt = 9,
+        // item 8 has moved_to_opt = 0, etc.; verify last non-default wins).
+        for (size_t i = 0; i < 10; ++i) {
+            ColumnarItemV1 m;
+            m.replica_id = (i == 4) ? 777ULL : 0ULL;  // last non-default at i=4
+            m.endpoint_idx = (i == 9) ? 0xFFFFFFFFu : 1u;
+            m.signed_delta = (i == 9) ? -5 : 2;
+            m.moved_to_opt = (i == 7) ? 88 : 0;  // last non-default at i=7
+            m.moved_to_oneof_b = (i == 8) ? 99 : 0;
+            m.moved_to_rep = (i < 3) ? static_cast<int32_t>(i + 1) : 0;
+            m.incompat_f32_to_i32 = 1.5f;
+            v1.merge_to_single.push_back(m);
+        }
+        for (int32_t i = 0; i < 12; ++i) {
+            ScalarMapEntryV1 e;
+            e.key = i - 4;
+            e.value = (i == 0) ? -1 : (i * 10);
+            v1.scalar_entries.push_back(e);
+        }
+        for (int i = 0; i < 10; ++i) {
+            BoolMapEntryV1 be;
+            be.key = (i % 2 == 0);
+            be.value = (i >= 8);
+            v1.bool_entries.push_back(be);
+        }
+
+        butil::IOBuf buf;
+        ASSERT_TRUE(v1.EncodeTo(&buf));
+
+        for (bool fragmented : {false, true}) {
+            butil::IOBuf in =
+                fragmented ? make_chunked(buf.to_string(), 5) : buf;
+            ColumnarBatchV2 v2;
+            // Pre-populate stale values
+            v2.items.resize(20);
+            for (auto& it : v2.items) {
+                it.added_label = "stale";
+                it.incompat_f32_to_i32 = 777;
+                it.protocol_idx = 888;
+                it.emplace_moved_to_oneof_a(123);
+            }
+            ASSERT_TRUE(v2.DecodeFrom(in)) << "fragmented=" << fragmented;
+            EXPECT_EQ(v2.batch_id, 7u);
+            ASSERT_EQ(v2.items.size(), 16u);
+            // Verify exact signedness widening on columnar columns!
+            EXPECT_EQ(v2.items[0].endpoint_idx, 4294967295LL);
+            EXPECT_EQ(v2.items[0].signed_delta,
+                      static_cast<uint64_t>(int64_t{-10}));
+            EXPECT_EQ(v2.items[0].protocol_idx, 0ULL);
+            EXPECT_TRUE(v2.items[0].added_label.empty());
+            EXPECT_EQ(v2.items[0].incompat_f32_to_i32, 0);
+            EXPECT_FALSE(v2.items[0].moved_to_opt.has_value());
+            ASSERT_TRUE(v2.items[1].moved_to_opt.has_value());
+            EXPECT_EQ(*v2.items[1].moved_to_opt, 1);
+            ASSERT_TRUE(v2.items[0].has_moved_to_oneof_a());
+            EXPECT_EQ(v2.items[0].moved_to_oneof_a(), 1);
+            ASSERT_TRUE(v2.items[1].has_moved_to_oneof_b());
+            EXPECT_EQ(v2.items[1].moved_to_oneof_b(), 101);
+            EXPECT_TRUE(v2.items[0].moved_to_rep.empty());
+            EXPECT_EQ(v2.items[1].moved_to_rep, (std::vector<int32_t>{10}));
+
+            // Verify columnar -> singular merge
+            ASSERT_TRUE(v2.merge_to_single.has_value());
+            EXPECT_EQ(v2.merge_to_single->replica_id, 777ULL);
+            EXPECT_EQ(v2.merge_to_single->endpoint_idx, 4294967295LL);
+            EXPECT_EQ(v2.merge_to_single->signed_delta,
+                      static_cast<uint64_t>(int64_t{-5}));
+            ASSERT_TRUE(v2.merge_to_single->moved_to_opt.has_value());
+            EXPECT_EQ(*v2.merge_to_single->moved_to_opt, 88);
+            ASSERT_TRUE(v2.merge_to_single->has_moved_to_oneof_b());
+            EXPECT_EQ(v2.merge_to_single->moved_to_oneof_b(), 99);
+            EXPECT_EQ(v2.merge_to_single->moved_to_rep,
+                      (std::vector<int32_t>{1, 2, 3}));
+            EXPECT_EQ(v2.merge_to_single->incompat_f32_to_i32, 0);
+
+            // Verify columnar repeated MapEntry -> map<int64, uint64> &
+            // map<bool, bool>
+            ASSERT_EQ(v2.scalar_entries.size(), 12u);
+            EXPECT_EQ(v2.scalar_entries.at(-4LL),
+                      std::numeric_limits<uint64_t>::max());
+            EXPECT_EQ(v2.scalar_entries.at(7LL), 110ULL);
+            ASSERT_EQ(v2.bool_entries.size(), 2u);
+            EXPECT_TRUE(v2.bool_entries.at(true));
+            EXPECT_TRUE(v2.bool_entries.at(false));
+        }
+    }
+
+    // 3. Concatenated columnar batches must append cleanly!
+    {
+        ColumnarBatchV1 a, b;
+        for (size_t i = 0; i < 10; ++i) a.items.push_back(make_item(i));
+        for (size_t i = 10; i < 20; ++i) b.items.push_back(make_item(i));
+        butil::IOBuf ba, bb;
+        ASSERT_TRUE(a.EncodeTo(&ba));
+        ASSERT_TRUE(b.EncodeTo(&bb));
+        butil::IOBuf combined;
+        combined.append(ba.to_string() + bb.to_string());
+
+        ColumnarBatchV1 dst;
+        ASSERT_TRUE(dst.DecodeFrom(combined));
+        ASSERT_EQ(dst.items.size(), 20u);
+        for (size_t i = 0; i < 20; ++i) {
+            EXPECT_EQ(dst.items[i], make_item(i)) << "i=" << i;
+        }
+    }
+}
+
 }  // namespace
 }  // namespace brpc_fast::test

@@ -87,3 +87,59 @@ message NestedEvolutionV2 {
     EvolutionV2 child = 1;
     repeated EvolutionV2 items = 2;
 }
+
+// Evolved counterpart of WireV2CompatV1 verifying exact PB signedness on
+// cross-width conversion and strict float/double vs integer isolation.
+message WireV2CompatV2 {
+    int64 u32_to_i64 = 1;
+    uint64 i32_to_u64 = 2;
+    uint64 enum_to_u64 = 3;
+    repeated int64 rep_u32_to_i64 = 4;
+    repeated uint64 rep_i32_to_u64 = 5;
+
+    int32 f32_to_i32 = 6;
+    int64 f32_to_i64 = 7;
+    int64 f64_to_i64 = 8;
+    float i32_to_f32 = 9;
+    double i64_to_f64 = 10;
+    repeated int32 rep_f32_to_i32 = 11;
+    repeated int64 rep_f64_to_i64 = 12;
+
+    int64 sentinel = 15;
+}
+
+// Evolved (non-columnar-eligible!) counterpart of ColumnarItemV1:
+// - Widens endpoint_idx (uint32 -> int64, zero-extend) and signed_delta
+//   (int32 -> uint64, sign-extend)
+// - Evolves scalar -> optional, scalar -> oneof, scalar -> repeated
+// - Adds string field & removes removed_col (field 17)
+// - Changes incompat_f32_to_i32 (float -> int32, must be skipped)
+message ColumnarItemV2 {
+    uint64 replica_id = 1;
+    int64 status = 2;
+    uint64 buffer_address = 3;
+    uint64 size = 4;
+    int64 endpoint_idx = 5;
+    uint64 protocol_idx = 6;
+    uint64 signed_delta = 7;
+    int64 signed_big = 8;
+    bool pinned = 9;
+    float score = 10;
+    double weight = 11;
+    optional int32 moved_to_opt = 12;
+    oneof moved_choice {
+        int32 moved_to_oneof_a = 13;
+        int32 moved_to_oneof_b = 14;
+    }
+    repeated int32 moved_to_rep = 15;
+    int32 incompat_f32_to_i32 = 16;
+    string added_label = 18;
+}
+
+message ColumnarBatchV2 {
+    uint32 batch_id = 1;
+    repeated ColumnarItemV2 items = 2;
+    ColumnarItemV2 merge_to_single = 3;
+    map<int64, uint64> scalar_entries = 4;
+    map<bool, bool> bool_entries = 5;
+}
