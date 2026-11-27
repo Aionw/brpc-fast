@@ -142,4 +142,21 @@ message ColumnarBatchV2 {
     ColumnarItemV2 merge_to_single = 3;
     map<int64, uint64> scalar_entries = 4;
     map<bool, bool> bool_entries = 5;
+    map<int64, string> scalar_to_str_val_entries = 6;
+    map<string, int64> scalar_to_str_key_entries = 7;
+}
+
+message NarrowColumnV2 {
+    optional uint32 to_opt_u32 = 1;
+    oneof narrowed_choice {
+        int32 to_oneof_i32 = 2;
+        int32 other_branch = 5;
+    }
+    repeated uint32 to_rep_u32 = 3;
+    uint32 to_plain_u32 = 4;
+}
+
+message NarrowBatchV2 {
+    repeated NarrowColumnV2 items = 1;
+    NarrowColumnV2 merge_to_single = 2;
 }

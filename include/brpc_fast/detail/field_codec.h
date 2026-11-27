@@ -36,13 +36,14 @@ inline constexpr size_t kColumnarMinElements = 8;
 template <typename T>
 concept FastMessageLike =
     requires(const T& cm, T& m, SizeTape& st, uint8_t* dst, const uint32_t*& tp,
-             const uint8_t* cur, const uint8_t* end, int depth, FastReader& r,
-             std::vector<T>& vec, uint32_t count, bool already_present) {
+             const uint8_t* cur, const uint8_t* end, int depth, size_t* budget,
+             FastReader& r, std::vector<T>& vec, uint32_t count,
+             bool already_present) {
         { T::kUsesSizeTape } -> std::convertible_to<bool>;
         { T::kIsColumnarEligible } -> std::convertible_to<bool>;
         { cm.ComputeSize(st) } -> std::same_as<size_t>;
         { cm.EncodeUnchecked(dst, tp) } -> std::same_as<uint8_t*>;
-        { m.DecodeContiguous(cur, end, depth) } -> std::same_as<bool>;
+        { m.DecodeContiguous(cur, end, depth, budget) } -> std::same_as<bool>;
         { m.template DecodeLoop<false>(r) } -> std::same_as<bool>;
         { m.template DecodeLoop<true>(r) } -> std::same_as<bool>;
         { m.Decode(r) } -> std::same_as<bool>;
@@ -72,7 +73,7 @@ struct ValueCodec<bool> {
         return r.ReadBool(v);
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              bool& v) noexcept {
         if (cur >= end) [[unlikely]] {
             return false;
@@ -82,72 +83,11 @@ struct ValueCodec<bool> {
     }
 };
 
-// int32_t -> kSigned4
-template <>
-struct ValueCodec<int32_t> {
-    static constexpr WireType kWireType = WireType::kSigned4;
+template <typename T, WireType Wt>
+struct FixedValueCodec {
+    static constexpr WireType kWireType = Wt;
 
-    static inline size_t SizeValue(int32_t, SizeTape&) noexcept { return 4; }
-    static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, int32_t v,
-                                                const uint32_t*&) noexcept {
-        return WriteFixedRaw<int32_t>(dst, v);
-    }
-    static inline bool DecodeValue(FastReader& r, int32_t& v) noexcept {
-        return r.ReadFixed<int32_t>(v);
-    }
-    static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
-                                             int32_t& v) noexcept {
-        return ReadFixedContiguous<int32_t>(cur, end, v);
-    }
-};
-
-// uint32_t -> kUnsigned4
-template <>
-struct ValueCodec<uint32_t> {
-    static constexpr WireType kWireType = WireType::kUnsigned4;
-
-    static inline size_t SizeValue(uint32_t, SizeTape&) noexcept { return 4; }
-    static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, uint32_t v,
-                                                const uint32_t*&) noexcept {
-        return WriteFixedRaw<uint32_t>(dst, v);
-    }
-    static inline bool DecodeValue(FastReader& r, uint32_t& v) noexcept {
-        return r.ReadFixed<uint32_t>(v);
-    }
-    static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
-                                             uint32_t& v) noexcept {
-        return ReadFixedContiguous<uint32_t>(cur, end, v);
-    }
-};
-
-// float -> kFloat4
-template <>
-struct ValueCodec<float> {
-    static constexpr WireType kWireType = WireType::kFloat4;
-
-    static inline size_t SizeValue(float, SizeTape&) noexcept { return 4; }
-    static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, float v,
-                                                const uint32_t*&) noexcept {
-        return WriteFixedRaw<float>(dst, v);
-    }
-    static inline bool DecodeValue(FastReader& r, float& v) noexcept {
-        return r.ReadFixed<float>(v);
-    }
-    static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
-                                             float& v) noexcept {
-        return ReadFixedContiguous<float>(cur, end, v);
-    }
-};
-
-// int64_t / uint64_t -> kInt8
-template <typename T>
-struct ValueCodec<T, std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8>> {
-    static constexpr WireType kWireType = WireType::kInt8;
-
-    static inline size_t SizeValue(T, SizeTape&) noexcept { return 8; }
+    static inline size_t SizeValue(T, SizeTape&) noexcept { return sizeof(T); }
     static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, T v,
                                                 const uint32_t*&) noexcept {
         return WriteFixedRaw<T>(dst, v);
@@ -156,31 +96,23 @@ struct ValueCodec<T, std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8>> 
         return r.ReadFixed<T>(v);
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              T& v) noexcept {
         return ReadFixedContiguous<T>(cur, end, v);
     }
 };
 
-// double -> kFloat8
 template <>
-struct ValueCodec<double> {
-    static constexpr WireType kWireType = WireType::kFloat8;
-
-    static inline size_t SizeValue(double, SizeTape&) noexcept { return 8; }
-    static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, double v,
-                                                const uint32_t*&) noexcept {
-        return WriteFixedRaw<double>(dst, v);
-    }
-    static inline bool DecodeValue(FastReader& r, double& v) noexcept {
-        return r.ReadFixed<double>(v);
-    }
-    static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
-                                             double& v) noexcept {
-        return ReadFixedContiguous<double>(cur, end, v);
-    }
-};
+struct ValueCodec<int32_t> : FixedValueCodec<int32_t, WireType::kSigned4> {};
+template <>
+struct ValueCodec<uint32_t> : FixedValueCodec<uint32_t, WireType::kUnsigned4> {};
+template <>
+struct ValueCodec<float> : FixedValueCodec<float, WireType::kFloat4> {};
+template <typename T>
+struct ValueCodec<T, std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8>>
+    : FixedValueCodec<T, WireType::kInt8> {};
+template <>
+struct ValueCodec<double> : FixedValueCodec<double, WireType::kFloat8> {};
 
 // Enums -> kSigned4 (int32_t underlying value, sign-extends to 64-bit per PB)
 template <typename T>
@@ -201,7 +133,7 @@ struct ValueCodec<T, std::enable_if_t<std::is_enum_v<T>>> {
         return true;
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              T& v) noexcept {
         int32_t raw = 0;
         if (!ReadFixedContiguous<int32_t>(cur, end, raw)) {
@@ -230,7 +162,7 @@ struct ValueCodec<std::string> {
         return r.ReadString(v);
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              std::string& v) {
         return ReadStringContiguous(cur, end, v);
     }
@@ -264,7 +196,8 @@ struct ValueCodec<T> {
         const uint8_t* span = nullptr;
         const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
         if (st == SpanReadStatus::kContiguous) [[likely]] {
-            return v.DecodeContiguous(span, span + len, r.RemainingDepth() - 1);
+            return v.DecodeContiguous(span, span + len, r.RemainingDepth() - 1,
+                                      r.ExpandedBudgetPtr());
         }
         if (st == SpanReadStatus::kError) {
             return false;
@@ -286,7 +219,8 @@ struct ValueCodec<T> {
         const uint8_t* span = nullptr;
         const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
         if (st == SpanReadStatus::kContiguous) [[likely]] {
-            FastReader sub(span, len, r.RemainingDepth() - 1);
+            FastReader sub(span, len, r.RemainingDepth() - 1,
+                           r.ExpandedBudgetPtr());
             return v.template DecodeLoop<false>(sub);
         }
         if (st == SpanReadStatus::kError) {
@@ -301,7 +235,7 @@ struct ValueCodec<T> {
 
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
                                              const uint8_t* end, int depth,
-                                             T& v) {
+                                             size_t* budget, T& v) {
         if (depth <= 0) [[unlikely]] {
             return false;
         }
@@ -314,7 +248,7 @@ struct ValueCodec<T> {
         }
         const uint8_t* sub_cur = cur;
         cur += len;
-        return v.DecodeContiguous(sub_cur, sub_cur + len, depth - 1);
+        return v.DecodeContiguous(sub_cur, sub_cur + len, depth - 1, budget);
     }
 };
 
@@ -348,8 +282,10 @@ struct ValueCodec<IndirectBox<T>> {
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
                                              const uint8_t* end, int depth,
+                                             size_t* budget,
                                              IndirectBox<T>& v) {
-        return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, v.get());
+        return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, budget,
+                                                    v.get());
     }
 };
 
@@ -557,10 +493,7 @@ inline bool IsConstEncodedVector(const std::vector<E>& v) noexcept {
         if (v[1] != first || v[n - 1] != first || v[n >> 1] != first) {
             return false;
         }
-        for (size_t i = 2; i < n - 1; ++i) {
-            if (v[i] != first) return false;
-        }
-        return true;
+        return std::find(v.begin() + 2, v.end() - 1, !first) == (v.end() - 1);
     } else {
         if (static_cast<uint64_t>(n) * sizeof(E) > kMaxExpandedSeqBytes) {
             return false;
@@ -570,11 +503,8 @@ inline bool IsConstEncodedVector(const std::vector<E>& v) noexcept {
             !ScalarBitEqual(v[n >> 1], first)) {
             return false;
         }
-        const E* p = v.data();
-        for (size_t i = 2; i < n - 1; ++i) {
-            if (!ScalarBitEqual(p[i], first)) return false;
-        }
-        return true;
+        return std::all_of(v.begin() + 2, v.end() - 1,
+                           [first](E x) { return ScalarBitEqual(x, first); });
     }
 }
 
@@ -582,7 +512,8 @@ inline bool IsConstEncodedVector(const std::vector<E>& v) noexcept {
 
 template <bool Overwrite, typename T>
 inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
-                                         int depth, std::vector<T>& vec) {
+                                         int depth, size_t* budget,
+                                         std::vector<T>& vec) {
     uint32_t count = 0;
     if (!ReadVarint32Contiguous(cur, end, count)) [[unlikely]] {
         return false;
@@ -626,7 +557,7 @@ inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
             T* dst = vec.data();
             for (size_t i = base; i < reuse_end; ++i) {
                 if (!ValueCodec<T>::DecodeValueContiguous(
-                        cur, end, depth, dst[i])) [[unlikely]] {
+                        cur, end, depth, budget, dst[i])) [[unlikely]] {
                     return false;
                 }
             }
@@ -636,7 +567,7 @@ inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
             for (size_t i = std::max(base, existing); i < target; ++i) {
                 vec.emplace_back();
                 if (!ValueCodec<T>::DecodeValueContiguous(
-                        cur, end, depth, vec.back())) [[unlikely]] {
+                        cur, end, depth, budget, vec.back())) [[unlikely]] {
                     return false;
                 }
             }
@@ -653,7 +584,7 @@ inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
 template <bool Overwrite, typename T>
 inline bool DecodeRepeatedFieldContiguous(const uint8_t*& cur,
                                           const uint8_t* end, int depth,
-                                          std::vector<T>& vec) {
+                                          size_t* budget, std::vector<T>& vec) {
     if constexpr (kIsBulkCopyableElement<T>) {
         uint32_t byte_len = 0;
         if (!ReadVarint32Contiguous(cur, end, byte_len)) [[unlikely]] {
@@ -697,13 +628,62 @@ inline bool DecodeRepeatedFieldContiguous(const uint8_t*& cur,
         const uint8_t* sub_cur = cur;
         cur += body_len;
         return DecodeRepeatedBodyContiguous<Overwrite>(
-            sub_cur, sub_cur + body_len, depth, vec);
+            sub_cur, sub_cur + body_len, depth, budget, vec);
     }
+}
+
+template <bool Overwrite, typename T>
+inline bool DecodeConstRepeatedContiguous(const uint8_t*& cur,
+                                          const uint8_t* end, size_t* budget,
+                                          std::vector<T>& vec) {
+    uint32_t body_len = 0;
+    if (!ReadVarint32Contiguous(cur, end, body_len) ||
+        static_cast<size_t>(end - cur) < body_len) [[unlikely]] {
+        return false;
+    }
+    const uint8_t* p = cur;
+    const uint8_t* pend = cur + body_len;
+    cur += body_len;
+    uint32_t count = 0;
+    if (!ReadVarint32Contiguous(p, pend, count)) [[unlikely]] {
+        return false;
+    }
+    constexpr size_t kValBytes = std::is_same_v<T, bool> ? 1u : sizeof(T);
+    if (static_cast<size_t>(pend - p) != kValBytes) [[unlikely]] {
+        return false;
+    }
+    if (!ConsumeExpandedBudgetPtr(budget,
+                                  static_cast<uint64_t>(count) * kValBytes))
+        [[unlikely]] {
+        return false;
+    }
+    T val{};
+    if constexpr (std::is_same_v<T, bool>) {
+        val = (*p != 0);
+    } else if constexpr (std::is_enum_v<T>) {
+        int32_t raw = 0;
+        std::memcpy(&raw, p, 4);
+        val = static_cast<T>(LittleEndianToHost(raw));
+    } else {
+        T raw{};
+        std::memcpy(&raw, p, sizeof(T));
+        val = LittleEndianToHost(raw);
+    }
+    const size_t base = Overwrite ? 0 : vec.size();
+    vec.resize(base + count);
+    if constexpr (std::is_same_v<T, bool>) {
+        std::fill_n(vec.begin() + static_cast<std::ptrdiff_t>(base), count,
+                    val);
+    } else {
+        std::fill_n(vec.data() + base, count, val);
+    }
+    return true;
 }
 
 template <bool Overwrite, FastMessageLike T>
 inline bool DecodeColumnarContiguous(const uint8_t*& cur, const uint8_t* end,
-                                     int depth, std::vector<T>& vec) {
+                                     int depth, size_t* budget,
+                                     std::vector<T>& vec) {
     if (depth <= 0) [[unlikely]] {
         return false;
     }
@@ -714,7 +694,7 @@ inline bool DecodeColumnarContiguous(const uint8_t*& cur, const uint8_t* end,
     }
     const uint8_t* sub_cur = cur;
     cur += body_len;
-    FastReader sub(sub_cur, body_len, depth - 1);
+    FastReader sub(sub_cur, body_len, depth - 1, budget);
     return T::template DecodeColumnarVec<Overwrite>(sub, vec);
 }
 
@@ -752,7 +732,8 @@ inline bool DecodeRepeatedField(FastReader& r, std::vector<T>& vec) {
         const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
         if (st == SpanReadStatus::kContiguous) [[likely]] {
             return DecodeRepeatedBodyContiguous<Overwrite>(
-                span, span + len, r.RemainingDepth(), vec);
+                span, span + len, r.RemainingDepth(), r.ExpandedBudgetPtr(),
+                vec);
         }
         if (st == SpanReadStatus::kError) {
             return false;
@@ -850,7 +831,7 @@ BRPC_FAST_NOINLINE inline bool DecodeMapEntryLoop(
 
 template <typename K, typename V, typename H, typename E, typename A>
 inline bool DecodeMapEntryContiguous(const uint8_t* ecur, const uint8_t* eend,
-                                     int depth,
+                                     int depth, size_t* budget,
                                      std::unordered_map<K, V, H, E, A>& m) {
     const uint8_t* const orig_cur = ecur;
     K key{};
@@ -859,15 +840,15 @@ inline bool DecodeMapEntryContiguous(const uint8_t* ecur, const uint8_t* eend,
     constexpr uint32_t kValTag = MakeTag(2u, ValueCodec<V>::kWireType);
     if (ecur < eend && *ecur == static_cast<uint8_t>(kKeyTag)) {
         ++ecur;
-        if (!ValueCodec<K>::DecodeValueContiguous(ecur, eend, depth, key))
-            [[unlikely]] {
+        if (!ValueCodec<K>::DecodeValueContiguous(ecur, eend, depth, budget,
+                                                  key)) [[unlikely]] {
             return false;
         }
     }
     if (ecur < eend && *ecur == static_cast<uint8_t>(kValTag)) {
         ++ecur;
-        if (!ValueCodec<V>::DecodeValueContiguous(ecur, eend, depth, val))
-            [[unlikely]] {
+        if (!ValueCodec<V>::DecodeValueContiguous(ecur, eend, depth, budget,
+                                                  val)) [[unlikely]] {
             return false;
         }
     }
@@ -875,7 +856,8 @@ inline bool DecodeMapEntryContiguous(const uint8_t* ecur, const uint8_t* eend,
         m.insert_or_assign(std::move(key), std::move(val));
         return true;
     }
-    FastReader sub(orig_cur, static_cast<size_t>(eend - orig_cur), depth);
+    FastReader sub(orig_cur, static_cast<size_t>(eend - orig_cur), depth,
+                   budget);
     return DecodeMapEntryLoop(sub, m);
 }
 
@@ -887,7 +869,7 @@ inline bool DecodeMapSingleEntry(FastReader& r,
     const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
     if (st == SpanReadStatus::kContiguous) [[likely]] {
         return DecodeMapEntryContiguous(span, span + len, r.RemainingDepth(),
-                                        m);
+                                        r.ExpandedBudgetPtr(), m);
     }
     if (st == SpanReadStatus::kError) {
         return false;
@@ -901,7 +883,7 @@ inline bool DecodeMapSingleEntry(FastReader& r,
 
 template <typename K, typename V, typename H, typename E, typename A>
 inline bool DecodeMapBodyContiguous(const uint8_t* cur, const uint8_t* end,
-                                    int depth,
+                                    int depth, size_t* budget,
                                     std::unordered_map<K, V, H, E, A>& m) {
     uint32_t count = 0;
     if (!ReadVarint32Contiguous(cur, end, count)) [[unlikely]] {
@@ -919,7 +901,7 @@ inline bool DecodeMapBodyContiguous(const uint8_t* cur, const uint8_t* end,
         }
         const uint8_t* ecur = cur;
         cur += elen;
-        if (!DecodeMapEntryContiguous(ecur, ecur + elen, depth, m))
+        if (!DecodeMapEntryContiguous(ecur, ecur + elen, depth, budget, m))
             [[unlikely]] {
             return false;
         }
@@ -934,7 +916,8 @@ inline bool DecodeMapField(FastReader& r,
     const uint8_t* span = nullptr;
     const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
     if (st == SpanReadStatus::kContiguous) [[likely]] {
-        return DecodeMapBodyContiguous(span, span + len, r.RemainingDepth(), m);
+        return DecodeMapBodyContiguous(span, span + len, r.RemainingDepth(),
+                                       r.ExpandedBudgetPtr(), m);
     }
     if (st == SpanReadStatus::kError) {
         return false;
@@ -959,54 +942,54 @@ inline bool DecodeMapField(FastReader& r,
     return sub.Eof();
 }
 
-// Decodes a kColumnar encoded repeated MapEntry (scalar key + scalar value) into
-// a map<K, V>, preserving map <-> repeated MapEntry compatibility even when
-// the MapEntry struct was columnar-encoded!
+// Decodes a kColumnar encoded repeated MapEntry into a map<K, V>, preserving
+// full map <-> repeated MapEntry compatibility even when the MapEntry struct
+// was columnar-encoded or when K/V evolved to an incompatible non-scalar type.
 template <typename K, typename V, typename H, typename E, typename A>
 BRPC_FAST_NOINLINE inline bool DecodeMapFromColumnar(
     FastReader& r, std::unordered_map<K, V, H, E, A>& m) {
-    if constexpr (!kIsFixedScalarField<K> || !kIsFixedScalarField<V>) {
+    uint32_t body_len = 0;
+    if (!r.ReadVarint32(body_len)) return false;
+    FastReader sub(FastReader::kUninitialized);
+    if (!r.ReadSubReaderSlow(body_len, sub, /*check_depth=*/false)) {
         return false;
-    } else {
-        uint32_t body_len = 0;
-        if (!r.ReadVarint32(body_len)) return false;
-        FastReader sub(FastReader::kUninitialized);
-        if (!r.ReadSubReaderSlow(body_len, sub, /*check_depth=*/false)) {
-            return false;
+    }
+    uint32_t count = 0;
+    if (!sub.ReadVarint32(count)) return false;
+    constexpr size_t kKeyCost = kIsFixedScalarField<K> ? sizeof(K) : 0u;
+    constexpr size_t kValCost = kIsFixedScalarField<V> ? sizeof(V) : 0u;
+    // Account for temporary vectors plus unordered_map node/bucket overhead.
+    constexpr size_t kPerEntryCost = kKeyCost + kValCost + 48u;
+    if (!sub.ConsumeExpandedBudget(static_cast<uint64_t>(count) *
+                                   kPerEntryCost)) {
+        return false;
+    }
+    std::conditional_t<kIsFixedScalarField<K>, std::vector<K>, char> keys{};
+    std::conditional_t<kIsFixedScalarField<V>, std::vector<V>, char> vals{};
+    if constexpr (kIsFixedScalarField<K>) {
+        keys.resize(count);
+    }
+    if constexpr (kIsFixedScalarField<V>) {
+        vals.resize(count);
+    }
+    while (!sub.Eof()) {
+        uint32_t tag = 0;
+        if (!sub.ReadTag(tag)) return false;
+        const uint32_t fn = TagFieldNumber(tag);
+        const WireType wt = TagWireType(tag);
+        if (fn == 0u) return false;
+        if (wt != WireType::kSeq) {
+            if (!sub.SkipUnknownField(wt)) return false;
+            continue;
         }
-        uint32_t count = 0;
-        if (!sub.ReadVarint32(count)) return false;
-        if (static_cast<uint64_t>(count) * (sizeof(K) + sizeof(V)) >
-            kMaxExpandedSeqBytes) {
-            return false;
-        }
-        std::vector<K> keys(count);
-        std::vector<V> vals(count);
-        while (!sub.Eof()) {
-            uint32_t tag = 0;
-            if (!sub.ReadTag(tag)) return false;
-            const uint32_t fn = TagFieldNumber(tag);
-            const WireType wt = TagWireType(tag);
-            if (fn == 0u) return false;
-            if (wt != WireType::kSeq) {
-                if (!sub.SkipUnknownField(wt)) return false;
-                continue;
-            }
-            uint8_t raw_kind = 0;
-            if (!sub.ReadU8(raw_kind)) return false;
-            const SeqKind kind = static_cast<SeqKind>(raw_kind);
-            if (fn == 1u) {
+        uint8_t raw_kind = 0;
+        if (!sub.ReadU8(raw_kind)) return false;
+        const SeqKind kind = static_cast<SeqKind>(raw_kind);
+        if (fn == 1u) {
+            if constexpr (kIsFixedScalarField<K>) {
                 const CompatStatus st = ReadScalarColumn<K>(
                     sub, kind, count,
-                    [&](uint32_t i, K k) { keys[i] = k; });
-                if (st == CompatStatus::kError) return false;
-                if (st == CompatStatus::kIncompatible && !sub.SkipSeqBody()) {
-                    return false;
-                }
-            } else if (fn == 2u) {
-                const CompatStatus st = ReadScalarColumn<V>(
-                    sub, kind, count,
-                    [&](uint32_t i, V v) { vals[i] = v; });
+                    [&](uint32_t i, K k, bool) { keys[i] = k; });
                 if (st == CompatStatus::kError) return false;
                 if (st == CompatStatus::kIncompatible && !sub.SkipSeqBody()) {
                     return false;
@@ -1014,14 +997,47 @@ BRPC_FAST_NOINLINE inline bool DecodeMapFromColumnar(
             } else {
                 if (!sub.SkipSeqBody()) return false;
             }
+        } else if (fn == 2u) {
+            if constexpr (kIsFixedScalarField<V>) {
+                const CompatStatus st = ReadScalarColumn<V>(
+                    sub, kind, count,
+                    [&](uint32_t i, V v, bool) { vals[i] = v; });
+                if (st == CompatStatus::kError) return false;
+                if (st == CompatStatus::kIncompatible && !sub.SkipSeqBody()) {
+                    return false;
+                }
+            } else {
+                if (!sub.SkipSeqBody()) return false;
+            }
+        } else {
+            if (!sub.SkipSeqBody()) return false;
         }
-        m.reserve(m.size() + count);
-        for (uint32_t i = 0; i < count; ++i) {
-            m.insert_or_assign(static_cast<K>(keys[i]),
-                               static_cast<V>(vals[i]));
-        }
+    }
+    if (count == 0) {
         return true;
     }
+    if constexpr (!kIsFixedScalarField<K>) {
+        if constexpr (kIsFixedScalarField<V>) {
+            m.insert_or_assign(K{}, static_cast<V>(vals[count - 1]));
+        } else {
+            m.insert_or_assign(K{}, V{});
+        }
+    } else {
+        if constexpr (std::is_same_v<K, bool>) {
+            m.reserve(std::min<size_t>(m.size() + count, 2u));
+        } else {
+            m.reserve(m.size() + count);
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if constexpr (kIsFixedScalarField<V>) {
+                m.insert_or_assign(static_cast<K>(keys[i]),
+                                   static_cast<V>(vals[i]));
+            } else {
+                m.insert_or_assign(static_cast<K>(keys[i]), V{});
+            }
+        }
+    }
+    return true;
 }
 
 // ---- Unified type-dispatched FieldCodec entry points for codegen ----
@@ -1060,34 +1076,37 @@ inline size_t SizeField(const T& v, SizeTape& tape) {
             return hdr_sz + Varint32Size(static_cast<uint32_t>(byte_len)) +
                    byte_len;
         } else if constexpr (std::is_same_v<E, bool>) {
-            const uint32_t n = static_cast<uint32_t>(v.size());
+            const size_t n_sz = v.size();
+            if (n_sz > std::numeric_limits<uint32_t>::max()) [[unlikely]] {
+                return static_cast<size_t>(std::numeric_limits<int32_t>::max()) +
+                       1u;
+            }
+            const uint32_t n = static_cast<uint32_t>(n_sz);
             if (IsConstEncodedVector(v)) [[unlikely]] {
-                const uint32_t body_len = Varint32Size(n) + 1u;
-                return hdr_sz + Varint32Size(body_len) + body_len;
+                const size_t body_len =
+                    static_cast<size_t>(Varint32Size(n)) + 1u;
+                return hdr_sz + Varint32Size(static_cast<uint32_t>(body_len)) +
+                       body_len;
             }
-            const uint32_t body_len = Varint32Size(n) + ((n + 7u) >> 3);
-            return hdr_sz + Varint32Size(body_len) + body_len;
-        } else if constexpr (FastMessageLike<E>) {
-            if constexpr (E::kIsColumnarEligible) {
-                if (v.size() >= kColumnarMinElements &&
-                    static_cast<uint64_t>(v.size()) * sizeof(E) <=
-                        kMaxExpandedSeqBytes) {
-                    const size_t body_len = E::ComputeColumnarSize(
-                        v.data(), static_cast<uint32_t>(v.size()), tape);
-                    return hdr_sz +
-                           Varint32Size(static_cast<uint32_t>(body_len)) +
-                           body_len;
-                }
-            }
-            const size_t slot = tape.Reserve();
-            size_t body_len = Varint32Size(static_cast<uint32_t>(v.size()));
-            for (const auto& elem : v) {
-                body_len += ValueCodec<E>::SizeValue(elem, tape);
-            }
-            tape.Set(slot, static_cast<uint32_t>(body_len));
+            const size_t byte_cnt = (n_sz + 7u) >> 3;
+            const size_t body_len =
+                static_cast<size_t>(Varint32Size(n)) + byte_cnt;
             return hdr_sz + Varint32Size(static_cast<uint32_t>(body_len)) +
                    body_len;
         } else {
+            if constexpr (FastMessageLike<E>) {
+                if constexpr (E::kIsColumnarEligible) {
+                    if (v.size() >= kColumnarMinElements &&
+                        static_cast<uint64_t>(v.size()) * sizeof(E) <=
+                            kMaxExpandedSeqBytes) {
+                        const size_t body_len = E::ComputeColumnarSize(
+                            v.data(), static_cast<uint32_t>(v.size()), tape);
+                        return hdr_sz +
+                               Varint32Size(static_cast<uint32_t>(body_len)) +
+                               body_len;
+                    }
+                }
+            }
             const size_t slot = tape.Reserve();
             size_t body_len = Varint32Size(static_cast<uint32_t>(v.size()));
             for (const auto& elem : v) {
@@ -1165,7 +1184,8 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
                 return dst;
             }
         } else if constexpr (std::is_same_v<E, bool>) {
-            const uint32_t n = static_cast<uint32_t>(v.size());
+            const size_t n_sz = v.size();
+            const uint32_t n = static_cast<uint32_t>(n_sz);
             if (IsConstEncodedVector(v)) [[unlikely]] {
                 dst =
                     WriteConstSeqHeader<FieldNumber, SeqKind::kConstBool>(dst);
@@ -1175,11 +1195,12 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
                 return dst;
             }
             dst = WriteConstSeqHeader<FieldNumber, SeqKind::kBitBool>(dst);
-            const uint32_t byte_cnt = (n + 7u) >> 3;
-            dst = WriteVarint32Raw(dst, Varint32Size(n) + byte_cnt);
+            const size_t byte_cnt = (n_sz + 7u) >> 3;
+            dst = WriteVarint32Raw(
+                dst, static_cast<uint32_t>(Varint32Size(n) + byte_cnt));
             dst = WriteVarint32Raw(dst, n);
-            uint32_t i = 0;
-            for (; i + 8 <= n; i += 8) {
+            size_t i = 0;
+            for (; i + 8 <= n_sz; i += 8) {
                 const uint8_t byte = static_cast<uint8_t>(
                     (v[i] ? 1u : 0u) | ((v[i + 1] ? 1u : 0u) << 1) |
                     ((v[i + 2] ? 1u : 0u) << 2) | ((v[i + 3] ? 1u : 0u) << 3) |
@@ -1187,34 +1208,28 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
                     ((v[i + 6] ? 1u : 0u) << 6) | ((v[i + 7] ? 1u : 0u) << 7));
                 *dst++ = byte;
             }
-            if (i < n) {
+            if (i < n_sz) {
                 uint8_t byte = 0;
-                for (uint32_t bit = 0; i < n; ++i, ++bit) {
+                for (uint32_t bit = 0; i < n_sz; ++i, ++bit) {
                     if (v[i]) byte |= static_cast<uint8_t>(1u << bit);
                 }
                 *dst++ = byte;
             }
             return dst;
-        } else if constexpr (FastMessageLike<E>) {
-            if constexpr (E::kIsColumnarEligible) {
-                if (v.size() >= kColumnarMinElements &&
-                    static_cast<uint64_t>(v.size()) * sizeof(E) <=
-                        kMaxExpandedSeqBytes) {
-                    dst = WriteConstSeqHeader<FieldNumber, SeqKind::kColumnar>(
-                        dst);
-                    return E::EncodeColumnarUnchecked(
-                        dst, v.data(), static_cast<uint32_t>(v.size()), tape);
+        } else {
+            if constexpr (FastMessageLike<E>) {
+                if constexpr (E::kIsColumnarEligible) {
+                    if (v.size() >= kColumnarMinElements &&
+                        static_cast<uint64_t>(v.size()) * sizeof(E) <=
+                            kMaxExpandedSeqBytes) {
+                        dst = WriteConstSeqHeader<FieldNumber,
+                                                  SeqKind::kColumnar>(dst);
+                        return E::EncodeColumnarUnchecked(
+                            dst, v.data(), static_cast<uint32_t>(v.size()),
+                            tape);
+                    }
                 }
             }
-            dst = WriteConstSeqHeader<FieldNumber, SeqKind::kBytesList>(dst);
-            const uint32_t body_len = *tape++;
-            dst = WriteVarint32Raw(dst, body_len);
-            dst = WriteVarint32Raw(dst, static_cast<uint32_t>(v.size()));
-            for (const auto& elem : v) {
-                dst = ValueCodec<E>::EncodeValueUnchecked(dst, elem, tape);
-            }
-            return dst;
-        } else {
             dst = WriteConstSeqHeader<FieldNumber, SeqKind::kBytesList>(dst);
             const uint32_t body_len = *tape++;
             dst = WriteVarint32Raw(dst, body_len);
@@ -1243,7 +1258,7 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
 // tag+SeqKind matching without falling back to DecodeLoop.
 template <uint32_t FieldNumber, typename T>
 inline bool TryDecodeFieldContiguous(const uint8_t*& cur, const uint8_t* end,
-                                     int depth, T& field) {
+                                     int depth, size_t* budget, T& field) {
     if constexpr (IsUnorderedMap<T>::value) {
         if (MatchConstSeqHeader<FieldNumber, SeqKind::kBytesList>(cur, end)) {
             uint32_t body_len = 0;
@@ -1255,7 +1270,7 @@ inline bool TryDecodeFieldContiguous(const uint8_t*& cur, const uint8_t* end,
             cur += body_len;
             ClearMap(field);
             return DecodeMapBodyContiguous(sub_cur, sub_cur + body_len, depth,
-                                           field);
+                                           budget, field);
         }
         ClearMap(field);
         return true;
@@ -1266,12 +1281,20 @@ inline bool TryDecodeFieldContiguous(const uint8_t*& cur, const uint8_t* end,
                 if (MatchConstSeqHeader<FieldNumber, SeqKind::kColumnar>(cur,
                                                                          end)) {
                     return DecodeColumnarContiguous<true>(cur, end, depth,
-                                                          field);
+                                                          budget, field);
                 }
             }
         }
         if (MatchConstSeqHeader<FieldNumber, FieldSeqKind<T>()>(cur, end)) {
-            return DecodeRepeatedFieldContiguous<true>(cur, end, depth, field);
+            return DecodeRepeatedFieldContiguous<true>(cur, end, depth, budget,
+                                                       field);
+        }
+        if constexpr (kIsFixedScalarField<E>) {
+            if (MatchConstSeqHeader<FieldNumber, ConstSeqKindFor<E>()>(cur,
+                                                                       end)) {
+                return DecodeConstRepeatedContiguous<true>(cur, end, budget,
+                                                           field);
+            }
         }
         ClearVector(field);
         return true;
@@ -1281,13 +1304,14 @@ inline bool TryDecodeFieldContiguous(const uint8_t*& cur, const uint8_t* end,
                 field.emplace();
             }
             return ValueCodec<typename T::value_type>::DecodeValueContiguous(
-                cur, end, depth, *field);
+                cur, end, depth, budget, *field);
         }
         field.reset();
         return true;
     } else {
         if (MatchConstTag<kFieldTag<FieldNumber, T>>(cur, end)) {
-            return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, field);
+            return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, budget,
+                                                        field);
         }
         ResetField(field);
         return true;
@@ -1339,13 +1363,8 @@ inline bool DecodeFieldInLoop(FastReader& r, uint32_t tag, WireType wt,
                 return DecodeMapField(r, field);
             }
             if (static_cast<SeqKind>(raw_kind) == SeqKind::kColumnar) {
-                using K = typename T::key_type;
-                using V = typename T::mapped_type;
-                if constexpr (kIsFixedScalarField<K> &&
-                              kIsFixedScalarField<V>) {
-                    if (mark_first_seen()) ClearMap(field);
-                    return DecodeMapFromColumnar(r, field);
-                }
+                if (mark_first_seen()) ClearMap(field);
+                return DecodeMapFromColumnar(r, field);
             }
             return r.CaptureUnknownSeqField(tag, raw_kind, unknown);
         }

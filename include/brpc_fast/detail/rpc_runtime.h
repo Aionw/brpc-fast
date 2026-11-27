@@ -68,8 +68,7 @@ void DispatchServerMethod(::brpc::Controller* cntl,
     constexpr size_t kMaxRetainedReqBytes = 8u * 1024u * 1024u;
     ::brpc::ClosureGuard done_guard(brpc_done);
     auto* slot = ::butil::get_object<ServerCallSlot<Req, Resp>>();
-    const bool clear_req_on_return =
-        raw_req->serialized_data().size() > kMaxRetainedReqBytes;
+    const size_t wire_req_bytes = raw_req->serialized_data().size();
 
     struct SlotReturnGuard {
         ServerCallSlot<Req, Resp>* s;
@@ -81,12 +80,18 @@ void DispatchServerMethod(::brpc::Controller* cntl,
             s->resp.Clear();
             ::butil::return_object(s);
         }
-    } slot_guard{slot, clear_req_on_return};
+    } slot_guard{slot, wire_req_bytes > kMaxRetainedReqBytes};
 
-    if (!DecodeFromIOBuf(raw_req->serialized_data(), slot->req)) {
+    size_t expanded_req_bytes = 0;
+    if (!DecodeFromIOBufWithStats(raw_req->serialized_data(), slot->req,
+                                  expanded_req_bytes)) {
         cntl->SetFailed(::brpc::EREQUEST,
                         "brpc_fast: failed to decode request");
         return;
+    }
+    if (wire_req_bytes + expanded_req_bytes > kMaxRetainedReqBytes)
+        [[unlikely]] {
+        slot_guard.clear_req = true;
     }
 
     RpcContext ctx(cntl);
@@ -245,14 +250,14 @@ RpcFuture<Resp> CallClientMethodAsync(
         }
     } init_guard{state};
 
-    const ::brpc::CallId call_id = state->cntl().call_id();
     if (!EncodeToIOBuf(request, &state->raw_req().serialized_data())) {
         state->cntl().SetFailed(
             ::brpc::EREQUEST, "brpc_fast: encoded request exceeds size limit");
         init_guard.s = nullptr;
         state->Run();
-        return RpcFuture<Resp>(state, call_id);
+        return RpcFuture<Resp>(state, ::brpc::CallId{INVALID_BTHREAD_ID});
     }
+    const ::brpc::CallId call_id = state->cntl().call_id();
     init_guard.s = nullptr;
     channel->CallMethod(method, &state->cntl(), &state->raw_req(),
                         &state->raw_resp(), state);

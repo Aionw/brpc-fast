@@ -453,6 +453,22 @@ message ColumnarBatchV1 {
     repeated ColumnarItemV1 merge_to_single = 3;
     repeated ScalarMapEntryV1 scalar_entries = 4;
     repeated BoolMapEntryV1 bool_entries = 5;
+    repeated ScalarMapEntryV1 scalar_to_str_val_entries = 6;
+    repeated ScalarMapEntryV1 scalar_to_str_key_entries = 7;
+}
+
+// Columnar-eligible 64-bit source for testing narrowing-to-zero presence parity
+// (e.g., uint64(1ULL << 32) narrowed to uint32 == 0 must stay present).
+message NarrowColumnV1 {
+    uint64 to_opt_u32 = 1;
+    int64 to_oneof_i32 = 2;
+    uint64 to_rep_u32 = 3;
+    uint64 to_plain_u32 = 4;
+}
+
+message NarrowBatchV1 {
+    repeated NarrowColumnV1 items = 1;
+    repeated NarrowColumnV1 merge_to_single = 2;
 }
 
 // Constant-vector & bit-packed bool round-trip container.

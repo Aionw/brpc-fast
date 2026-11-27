@@ -19,6 +19,48 @@ inline constexpr size_t kMaxEncodedMessageBytes =
 template <typename T>
 concept FastMessage = detail::FastMessageLike<T>;
 
+namespace detail {
+
+template <FastMessageLike T>
+inline bool EncodeMessageWithSize(const T& msg, size_t total,
+                                  const uint32_t* tape_ptr,
+                                  butil::IOBuf* out) {
+    if (total == 0) {
+        return true;
+    }
+    if (total > kMaxEncodedMessageBytes) [[unlikely]] {
+        return false;
+    }
+    if (total <= kInlineEncodeCapacity) {
+        uint8_t stack_buf[kInlineEncodeCapacity];
+        msg.EncodeUnchecked(stack_buf, tape_ptr);
+        return out->append(stack_buf, total) == 0;
+    }
+    uint8_t* slab = WriteSlabPool::Instance().Acquire(total);
+    msg.EncodeUnchecked(slab, tape_ptr);
+    if (out->append_user_data(slab, total, &WriteSlabPool::Release) != 0)
+        [[unlikely]] {
+        WriteSlabPool::Release(slab);
+        return false;
+    }
+    return true;
+}
+
+template <FastMessageLike T>
+inline bool DecodeFromIOBufWithStats(const butil::IOBuf& in, T& msg,
+                                     size_t& expanded_bytes_out) {
+    FastReader r(in);
+    if (!msg.Decode(r)) [[unlikely]] {
+        msg.Clear();
+        expanded_bytes_out = 0;
+        return false;
+    }
+    expanded_bytes_out = r.ConsumedExpandedBytes();
+    return true;
+}
+
+}  // namespace detail
+
 // Encodes `msg` into `out` using a two-pass size-tape + zero-copy slab path.
 // Returns false if the encoded message exceeds kMaxEncodedMessageBytes or if
 // appending to `out` fails.
@@ -28,53 +70,11 @@ inline bool EncodeToIOBuf(const T& msg, butil::IOBuf* out) {
         detail::SizeTapeGuard tape_guard;
         detail::SizeTape& tape = tape_guard.Tape();
         const size_t total = msg.ComputeSize(tape);
-        if (total == 0) {
-            return true;
-        }
-        if (total > kMaxEncodedMessageBytes) [[unlikely]] {
-            return false;
-        }
-        const uint32_t* tape_ptr = tape.Data();
-        if (total <= detail::kInlineEncodeCapacity) {
-            uint8_t stack_buf[detail::kInlineEncodeCapacity];
-            msg.EncodeUnchecked(stack_buf, tape_ptr);
-            return out->append(stack_buf, total) == 0;
-        } else {
-            uint8_t* slab = detail::WriteSlabPool::Instance().Acquire(total);
-            msg.EncodeUnchecked(slab, tape_ptr);
-            if (out->append_user_data(slab, total,
-                                      &detail::WriteSlabPool::Release) != 0)
-                [[unlikely]] {
-                detail::WriteSlabPool::Release(slab);
-                return false;
-            }
-        }
-        return true;
+        return detail::EncodeMessageWithSize(msg, total, tape.Data(), out);
     } else {
         detail::SizeTape unused_tape;
         const size_t total = msg.ComputeSize(unused_tape);
-        if (total == 0) {
-            return true;
-        }
-        if (total > kMaxEncodedMessageBytes) [[unlikely]] {
-            return false;
-        }
-        const uint32_t* tape_ptr = nullptr;
-        if (total <= detail::kInlineEncodeCapacity) {
-            uint8_t stack_buf[detail::kInlineEncodeCapacity];
-            msg.EncodeUnchecked(stack_buf, tape_ptr);
-            return out->append(stack_buf, total) == 0;
-        } else {
-            uint8_t* slab = detail::WriteSlabPool::Instance().Acquire(total);
-            msg.EncodeUnchecked(slab, tape_ptr);
-            if (out->append_user_data(slab, total,
-                                      &detail::WriteSlabPool::Release) != 0)
-                [[unlikely]] {
-                detail::WriteSlabPool::Release(slab);
-                return false;
-            }
-        }
-        return true;
+        return detail::EncodeMessageWithSize(msg, total, nullptr, out);
     }
 }
 
@@ -82,12 +82,8 @@ inline bool EncodeToIOBuf(const T& msg, butil::IOBuf* out) {
 // existing container/string capacities. Resets `msg` to defaults on failure.
 template <FastMessage T>
 inline bool DecodeFromIOBuf(const butil::IOBuf& in, T& msg) {
-    detail::FastReader r(in);
-    if (!msg.Decode(r)) [[unlikely]] {
-        msg.Clear();
-        return false;
-    }
-    return true;
+    size_t unused_expanded = 0;
+    return detail::DecodeFromIOBufWithStats(in, msg, unused_expanded);
 }
 
 }  // namespace brpc_fast

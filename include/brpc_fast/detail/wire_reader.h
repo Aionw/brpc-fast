@@ -57,9 +57,21 @@ enum class SeqKind : uint8_t {
 };
 
 // Maximum expanded byte budget allowed for compressed/virtual container
-// payloads (kConst* and kColumnar) to guard against tiny corrupt/crafted
-// packets triggering unbounded memory allocations.
+// payloads (kConst*, kColumnar, widened kBitBool, etc.) across a single decode
+// to guard against tiny corrupt/crafted packets triggering unbounded memory
+// allocations (including across repeated tags or nested messages).
 inline constexpr size_t kMaxExpandedSeqBytes = 256ULL * 1024ULL * 1024ULL;
+
+inline bool ConsumeExpandedBudgetPtr(size_t* budget, uint64_t bytes) noexcept {
+    if (budget == nullptr) {
+        return bytes <= kMaxExpandedSeqBytes;
+    }
+    if (bytes > *budget) [[unlikely]] {
+        return false;
+    }
+    *budget -= static_cast<size_t>(bytes);
+    return true;
+}
 
 // Result of FastReader::TryReadContiguousSpan().
 enum class SpanReadStatus : uint8_t {
@@ -462,14 +474,19 @@ class FastReader {
 
     explicit FastReader(
         const butil::IOBuf& buf,
-        int remaining_depth = kDefaultMaxRecursionDepth) noexcept
+        int remaining_depth = kDefaultMaxRecursionDepth,
+        size_t* shared_budget = nullptr) noexcept
         : buf_(&buf),
           cur_(nullptr),
           seg_end_(nullptr),
           block_idx_(0),
           block_count_(buf.backing_block_num()),
           rem_after_seg_(0),
-          remaining_depth_(remaining_depth) {
+          remaining_depth_(remaining_depth),
+          expanded_budget_storage_(kMaxExpandedSeqBytes),
+          expanded_budget_(shared_budget != nullptr
+                               ? shared_budget
+                               : &expanded_budget_storage_) {
         const size_t total = buf.size();
         if (total == 0 || block_count_ == 0) {
             return;
@@ -479,14 +496,19 @@ class FastReader {
     }
 
     FastReader(const uint8_t* data, size_t size,
-               int remaining_depth = kDefaultMaxRecursionDepth) noexcept
+               int remaining_depth = kDefaultMaxRecursionDepth,
+               size_t* shared_budget = nullptr) noexcept
         : buf_(nullptr),
           cur_(data),
           seg_end_(data + size),
           block_idx_(0),
           block_count_(0),
           rem_after_seg_(0),
-          remaining_depth_(remaining_depth) {}
+          remaining_depth_(remaining_depth),
+          expanded_budget_storage_(kMaxExpandedSeqBytes),
+          expanded_budget_(shared_budget != nullptr
+                               ? shared_budget
+                               : &expanded_budget_storage_) {}
 
     FastReader(const FastReader&) = delete;
     FastReader& operator=(const FastReader&) = delete;
@@ -505,6 +527,17 @@ class FastReader {
     }
 
     inline int RemainingDepth() const noexcept { return remaining_depth_; }
+
+    inline size_t* ExpandedBudgetPtr() noexcept { return expanded_budget_; }
+    inline size_t RemainingExpandedBudget() const noexcept {
+        return *expanded_budget_;
+    }
+    inline size_t ConsumedExpandedBytes() const noexcept {
+        return kMaxExpandedSeqBytes - *expanded_budget_;
+    }
+    inline bool ConsumeExpandedBudget(uint64_t bytes) noexcept {
+        return ConsumeExpandedBudgetPtr(expanded_budget_, bytes);
+    }
 
     inline bool ReadU8(uint8_t& out) noexcept {
         if (cur_ < seg_end_) [[likely]] {
@@ -631,6 +664,9 @@ class FastReader {
 
     BRPC_FAST_NOINLINE bool ReadSubReaderSlow(uint32_t len, FastReader& sub_out,
                                               bool check_depth) noexcept {
+        if (check_depth && remaining_depth_ <= 0) [[unlikely]] {
+            return false;
+        }
         if (Remaining() < len) {
             return false;
         }
@@ -644,6 +680,7 @@ class FastReader {
             sub_out.block_count_ = 0;
             sub_out.rem_after_seg_ = 0;
             sub_out.remaining_depth_ = next_depth;
+            sub_out.expanded_budget_ = expanded_budget_;
             return true;
         }
         if (cur_ == seg_end_ && !AdvanceBlock()) {
@@ -658,6 +695,7 @@ class FastReader {
             sub_out.block_count_ = 0;
             sub_out.rem_after_seg_ = 0;
             sub_out.remaining_depth_ = next_depth;
+            sub_out.expanded_budget_ = expanded_budget_;
             cur_ += len;
             return true;
         }
@@ -668,6 +706,7 @@ class FastReader {
         sub_out.block_count_ = block_count_;
         sub_out.rem_after_seg_ = len - avail;
         sub_out.remaining_depth_ = next_depth;
+        sub_out.expanded_budget_ = expanded_budget_;
         return SkipSlow(len);
     }
 
@@ -919,6 +958,8 @@ class FastReader {
     size_t block_count_;
     size_t rem_after_seg_;
     int remaining_depth_;
+    size_t expanded_budget_storage_;
+    size_t* expanded_budget_;
 };
 
 }  // namespace brpc_fast::detail
