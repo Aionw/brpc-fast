@@ -182,6 +182,38 @@ fast_msg::BatchPutStartRequest MakeBatchPutReq(size_t batch_size,
     return req;
 }
 
+fast_msg::BatchCompactReplicaResponse MakeBatchCompactResp(
+    size_t batch_size, size_t replicas_per_key) {
+    fast_msg::BatchCompactReplicaResponse resp;
+    resp.key_count = static_cast<uint32_t>(batch_size);
+    resp.lease_ttl_ms = 5000;
+    resp.endpoints = {"10.0.0.10:15000", "10.0.0.11:15000", "10.0.0.12:15000",
+                      "10.0.0.13:15000"};
+    resp.protocols = {"rdma"};
+    const size_t total = batch_size * replicas_per_key;
+    resp.memory_replicas.resize(total);
+    for (size_t i = 0; i < total; ++i) {
+        auto& r = resp.memory_replicas[i];
+        r.replica_id = i + 1;
+        r.status = fast_msg::ReplicaStatus::REPLICA_COMPLETE;
+        r.buffer_address = 0x7f0000000000ULL + i * 4096ULL;
+        r.size = 1048576ULL;
+        r.endpoint_idx = static_cast<uint32_t>(i & 3u);
+        r.protocol_idx = 0u;
+    }
+    return resp;
+}
+
+fast_msg::BatchExistKeyResponse MakeBatchExistResp(size_t batch_size) {
+    fast_msg::BatchExistKeyResponse resp;
+    resp.error_codes.assign(batch_size, 0);
+    resp.exists.resize(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+        resp.exists[i] = ((i * 37 + 1) % 5) != 0;
+    }
+    return resp;
+}
+
 template <typename MsgT>
 void RunCodecBench(const std::string& scenario, const MsgT& src, size_t iters,
                    std::vector<CodecRow>* out_rows) {
@@ -600,6 +632,11 @@ int main(int argc, char* argv[]) {
             "BatchPutStart(" + std::to_string(bs) + ")",
             MakeBatchPutReq(bs, FLAGS_key_len, FLAGS_replicas_per_key),
             batch_iters, &codec_rows);
+        RunCodecBench("BatchCompact(" + std::to_string(bs) + ")",
+                      MakeBatchCompactResp(bs, FLAGS_replicas_per_key),
+                      batch_iters, &codec_rows);
+        RunCodecBench("BatchExistKey(" + std::to_string(bs) + ")",
+                      MakeBatchExistResp(bs), batch_iters * 2, &codec_rows);
         PrintCodecTable(codec_rows);
     }
 

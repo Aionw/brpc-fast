@@ -79,6 +79,30 @@ message BatchPutStartResponse {
     repeated KeyReplicaResult results = 1;
 }
 
+// Flat scalar-only replica descriptor (columnar-eligible) mirroring
+// dictionary-compressed metadata batch responses.
+message CompactMemoryReplica {
+    uint64 replica_id = 1;
+    ReplicaStatus status = 2;
+    uint64 buffer_address = 3;
+    uint64 size = 4;
+    uint32 endpoint_idx = 5;
+    uint32 protocol_idx = 6;
+}
+
+message BatchCompactReplicaResponse {
+    uint32 key_count = 1;
+    uint64 lease_ttl_ms = 2;
+    repeated string endpoints = 3;
+    repeated string protocols = 4;
+    repeated CompactMemoryReplica memory_replicas = 5;
+}
+
+message BatchExistKeyResponse {
+    repeated int32 error_codes = 1;
+    repeated bool exists = 2;
+}
+
 service BenchMasterService {
     rpc Ping(PingRequest) returns (PingResponse);
     rpc GetReplica(GetReplicaRequest) returns (GetReplicaResponse);

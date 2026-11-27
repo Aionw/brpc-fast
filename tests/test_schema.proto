@@ -395,6 +395,95 @@ message Proto3CompatExtV1 {
     int64 trailing_sentinel = 15;
 }
 
+// Wire v2 strict signedness & float/int isolation tests (paired with
+// WireV2CompatV2 in test_schema_v2.proto and WireV2IncompatPreserve in
+// test_preserve.proto).
+message WireV2CompatV1 {
+    uint32 u32_to_i64 = 1;
+    int32 i32_to_u64 = 2;
+    ReplicaStatus enum_to_u64 = 3;
+    repeated uint32 rep_u32_to_i64 = 4;
+    repeated int32 rep_i32_to_u64 = 5;
+
+    float f32_to_i32 = 6;
+    float f32_to_i64 = 7;
+    double f64_to_i64 = 8;
+    int32 i32_to_f32 = 9;
+    int64 i64_to_f64 = 10;
+    repeated float rep_f32_to_i32 = 11;
+    repeated double rep_f64_to_i64 = 12;
+
+    int64 sentinel = 15;
+}
+
+// Flat scalar-only struct eligible for SeqKind::kColumnar when repeated.
+message ColumnarItemV1 {
+    uint64 replica_id = 1;
+    ReplicaStatus status = 2;
+    uint64 buffer_address = 3;
+    uint64 size = 4;
+    uint32 endpoint_idx = 5;
+    uint32 protocol_idx = 6;
+    int32 signed_delta = 7;
+    int64 signed_big = 8;
+    bool pinned = 9;
+    float score = 10;
+    double weight = 11;
+    int32 moved_to_opt = 12;
+    int32 moved_to_oneof_a = 13;
+    int32 moved_to_oneof_b = 14;
+    int32 moved_to_rep = 15;
+    float incompat_f32_to_i32 = 16;
+    int32 removed_col = 17;
+}
+
+message ScalarMapEntryV1 {
+    int32 key = 1;
+    int32 value = 2;
+}
+
+message BoolMapEntryV1 {
+    bool key = 1;
+    bool value = 2;
+}
+
+message ColumnarBatchV1 {
+    uint32 batch_id = 1;
+    repeated ColumnarItemV1 items = 2;
+    repeated ColumnarItemV1 merge_to_single = 3;
+    repeated ScalarMapEntryV1 scalar_entries = 4;
+    repeated BoolMapEntryV1 bool_entries = 5;
+    repeated ScalarMapEntryV1 scalar_to_str_val_entries = 6;
+    repeated ScalarMapEntryV1 scalar_to_str_key_entries = 7;
+}
+
+// Columnar-eligible 64-bit source for testing narrowing-to-zero presence parity
+// (e.g., uint64(1ULL << 32) narrowed to uint32 == 0 must stay present).
+message NarrowColumnV1 {
+    uint64 to_opt_u32 = 1;
+    int64 to_oneof_i32 = 2;
+    uint64 to_rep_u32 = 3;
+    uint64 to_plain_u32 = 4;
+}
+
+message NarrowBatchV1 {
+    repeated NarrowColumnV1 items = 1;
+    repeated NarrowColumnV1 merge_to_single = 2;
+}
+
+// Constant-vector & bit-packed bool round-trip container.
+message SeqOptMsg {
+    repeated bool bits = 1;
+    repeated int32 const_i32 = 2;
+    repeated uint32 const_u32 = 3;
+    repeated int64 const_i64 = 4;
+    repeated uint64 const_u64 = 5;
+    repeated float const_f32 = 6;
+    repeated double const_f64 = 7;
+    repeated ReplicaStatus const_enum = 8;
+    int64 trailing = 9;
+}
+
 service EchoService {
     rpc Echo(EchoRequest) returns (EchoResponse);
     rpc BatchGetReplica(BatchGetReplicaRequest) returns (BatchGetReplicaResponse);

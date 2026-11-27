@@ -195,9 +195,12 @@ class FastMasterService : public ::brpc::BaiduMasterService {
     ~FastMasterService() override;
 
     // Register and take ownership of a FastServiceBase instance.
+    // Not thread-safe with ProcessRpcRequest; must only be called before
+    // brpc::Server::Start().
     int AddService(std::unique_ptr<FastServiceBase> service);
 
-    // Non-owning overload; caller must guarantee `service` outlives the server.
+    // Non-owning overload; caller must guarantee `service` outlives the server
+    // and only register services before brpc::Server::Start().
     int AddService(FastServiceBase* service);
 
     void ProcessRpcRequest(::brpc::Controller* cntl,

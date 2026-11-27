@@ -23,3 +23,31 @@ message IncompatiblePreserve {
     int64 incompat_msg_to_i64 = 14;
     int64 trailing_sentinel = 15;
 }
+
+// Shares field numbers with WireV2CompatV1 to verify float/int & repeated
+// float/int mismatches are preserved verbatim in _unknown_fields.
+message WireV2IncompatPreserve {
+    int32 f32_to_i32 = 6;
+    int64 f64_to_i64 = 8;
+    repeated int32 rep_f32_to_i32 = 11;
+    repeated int64 rep_f64_to_i64 = 12;
+    int64 sentinel = 15;
+}
+
+// Subset of ColumnarItemV1 compiled with PRESERVE_UNKNOWN_FIELDS to verify
+// unknown columns (e.g. status=2, size=4, signed_delta=7, pinned=9, score=10,
+// weight=11, removed_col=17) and incompatible columns (incompat_f32_to_i32=16)
+// survive columnar decode -> row-wise re-encode round-trips identically to
+// row-wise (< 8 items) decoding.
+message ColumnarItemPreserve {
+    uint64 replica_id = 1;
+    uint64 buffer_address = 3;
+    uint32 endpoint_idx = 5;
+    int32 incompat_f32_to_i32 = 16;
+}
+
+message ColumnarBatchPreserve {
+    uint32 batch_id = 1;
+    repeated ColumnarItemPreserve items = 2;
+    ColumnarItemPreserve merge_to_single = 3;
+}

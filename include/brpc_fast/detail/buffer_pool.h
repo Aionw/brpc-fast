@@ -4,10 +4,12 @@
 
 #include <butil/object_pool.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 namespace brpc_fast::detail {
 
@@ -22,52 +24,43 @@ inline constexpr size_t kInlineEncodeCapacity = 4096;
 class SizeTape {
    public:
     SizeTape() noexcept = default;
-    ~SizeTape() { delete[] ptr_; }
 
     SizeTape(const SizeTape&) = delete;
     SizeTape& operator=(const SizeTape&) = delete;
 
-    inline size_t Reserve() {
-        if (count_ == cap_) [[unlikely]] {
-            Grow();
+    inline void EnsureInitialCapacity() {
+        if (vec_.capacity() == 0) [[unlikely]] {
+            vec_.reserve(512);
         }
-        return count_++;
     }
 
-    inline void Set(size_t idx, uint32_t len) noexcept { ptr_[idx] = len; }
-    inline const uint32_t* Data() const noexcept { return ptr_; }
+    inline size_t Reserve() {
+        const size_t idx = vec_.size();
+        vec_.push_back(0u);
+        return idx;
+    }
+
+    inline void Set(size_t idx, uint32_t len) noexcept { vec_[idx] = len; }
+    inline const uint32_t* Data() const noexcept { return vec_.data(); }
 
     inline void Reset() noexcept {
-        count_ = 0;
+        vec_.clear();
         // Release pathological outlier buffers (> 2 MiB) so pooled tapes stay
         // bounded in steady state.
-        if (cap_ > (512u * 1024u)) [[unlikely]] {
-            delete[] ptr_;
-            ptr_ = nullptr;
-            cap_ = 0;
+        if (vec_.capacity() > (512u * 1024u)) [[unlikely]] {
+            std::vector<uint32_t>().swap(vec_);
         }
     }
 
    private:
-    BRPC_FAST_NOINLINE void Grow() {
-        const size_t new_cap = (cap_ == 0) ? 512 : (cap_ * 4);
-        uint32_t* new_buf = new uint32_t[new_cap];
-        if (count_ > 0) {
-            std::memcpy(new_buf, ptr_, count_ * sizeof(uint32_t));
-        }
-        delete[] ptr_;
-        ptr_ = new_buf;
-        cap_ = new_cap;
-    }
-
-    uint32_t* ptr_ = nullptr;
-    size_t cap_ = 0;
-    size_t count_ = 0;
+    std::vector<uint32_t> vec_;
 };
 
 class SizeTapeGuard {
    public:
-    SizeTapeGuard() noexcept : tape_(butil::get_object<SizeTape>()) {}
+    SizeTapeGuard() : tape_(butil::get_object<SizeTape>()) {
+        tape_->EnsureInitialCapacity();
+    }
     ~SizeTapeGuard() {
         if (tape_ != nullptr) {
             tape_->Reset();
@@ -90,7 +83,7 @@ class SizeTapeGuard {
 class WriteSlabPool {
    public:
     static constexpr size_t kNumClasses = 7;
-    static constexpr size_t kClassSizes[kNumClasses] = {
+    static constexpr std::array<size_t, kNumClasses> kClassSizes = {
         16u * 1024u,    // 16 KiB
         64u * 1024u,    // 64 KiB
         256u * 1024u,   // 256 KiB
@@ -99,7 +92,7 @@ class WriteSlabPool {
         4096u * 1024u,  // 4 MiB
         8192u * 1024u,  // 8 MiB
     };
-    static constexpr size_t kClassMaxKeep[kNumClasses] = {
+    static constexpr std::array<size_t, kNumClasses> kClassMaxKeep = {
         48, 48, 48, 48, 48, 32, 16,
     };
     static constexpr size_t kMaxSlots = 48;
@@ -161,10 +154,10 @@ class WriteSlabPool {
    private:
     struct alignas(64) SizeClass {
         std::mutex mu;
-        uint8_t* ptrs[kMaxSlots]{};
+        std::array<uint8_t*, kMaxSlots> ptrs{};
         size_t count = 0;
     };
-    SizeClass classes_[kNumClasses];
+    std::array<SizeClass, kNumClasses> classes_;
 };
 
 }  // namespace brpc_fast::detail

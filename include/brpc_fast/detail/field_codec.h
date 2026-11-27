@@ -19,19 +19,39 @@
 
 namespace brpc_fast::detail {
 
+// Result of slow-path Proto3 schema-evolution conversion.
+enum class CompatStatus : uint8_t {
+    kDecoded,       // Decoded successfully and updated target.
+    kEmpty,         // Valid empty seq/list payload; leave target untouched.
+    kIncompatible,  // Genuinely incompatible wire type/SeqKind; caller skips.
+    kError,         // Malformed/truncated wire payload.
+};
+
+// Minimum element count before encoding a columnar-eligible repeated message
+// using SeqKind::kColumnar instead of row-wise SeqKind::kBytesList.
+inline constexpr size_t kColumnarMinElements = 8;
+
 // ---- Message concept & ValueCodec traits ----
 
 template <typename T>
 concept FastMessageLike =
     requires(const T& cm, T& m, SizeTape& st, uint8_t* dst, const uint32_t*& tp,
-             const uint8_t* cur, const uint8_t* end, int depth, FastReader& r) {
+             const uint8_t* cur, const uint8_t* end, int depth, size_t* budget,
+             FastReader& r, std::vector<T>& vec, uint32_t count,
+             bool already_present) {
         { T::kUsesSizeTape } -> std::convertible_to<bool>;
+        { T::kIsColumnarEligible } -> std::convertible_to<bool>;
         { cm.ComputeSize(st) } -> std::same_as<size_t>;
         { cm.EncodeUnchecked(dst, tp) } -> std::same_as<uint8_t*>;
-        { m.DecodeContiguous(cur, end, depth) } -> std::same_as<bool>;
+        { m.DecodeContiguous(cur, end, depth, budget) } -> std::same_as<bool>;
         { m.template DecodeLoop<false>(r) } -> std::same_as<bool>;
         { m.template DecodeLoop<true>(r) } -> std::same_as<bool>;
         { m.Decode(r) } -> std::same_as<bool>;
+        { T::template DecodeColumnarVec<false>(r, vec) } -> std::same_as<bool>;
+        { T::template DecodeColumnarVec<true>(r, vec) } -> std::same_as<bool>;
+        {
+            T::DecodeColumnarSingular(r, count, m, already_present)
+        } -> std::same_as<CompatStatus>;
         { m.Clear() } -> std::same_as<void>;
     };
 
@@ -53,7 +73,7 @@ struct ValueCodec<bool> {
         return r.ReadBool(v);
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              bool& v) noexcept {
         if (cur >= end) [[unlikely]] {
             return false;
@@ -63,14 +83,11 @@ struct ValueCodec<bool> {
     }
 };
 
-// 4-byte arithmetic types (int32_t, uint32_t, float) -> kFixed4
-template <typename T>
-struct ValueCodec<
-    T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool> &&
-                        sizeof(T) == 4>> {
-    static constexpr WireType kWireType = WireType::kFixed4;
+template <typename T, WireType Wt>
+struct FixedValueCodec {
+    static constexpr WireType kWireType = Wt;
 
-    static inline size_t SizeValue(T, SizeTape&) noexcept { return 4; }
+    static inline size_t SizeValue(T, SizeTape&) noexcept { return sizeof(T); }
     static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, T v,
                                                 const uint32_t*&) noexcept {
         return WriteFixedRaw<T>(dst, v);
@@ -79,37 +96,28 @@ struct ValueCodec<
         return r.ReadFixed<T>(v);
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              T& v) noexcept {
         return ReadFixedContiguous<T>(cur, end, v);
     }
 };
 
-// 8-byte arithmetic types (int64_t, uint64_t, double) -> kFixed8
+template <>
+struct ValueCodec<int32_t> : FixedValueCodec<int32_t, WireType::kSigned4> {};
+template <>
+struct ValueCodec<uint32_t> : FixedValueCodec<uint32_t, WireType::kUnsigned4> {};
+template <>
+struct ValueCodec<float> : FixedValueCodec<float, WireType::kFloat4> {};
 template <typename T>
-struct ValueCodec<T,
-                  std::enable_if_t<std::is_arithmetic_v<T> && sizeof(T) == 8>> {
-    static constexpr WireType kWireType = WireType::kFixed8;
+struct ValueCodec<T, std::enable_if_t<std::is_integral_v<T> && sizeof(T) == 8>>
+    : FixedValueCodec<T, WireType::kInt8> {};
+template <>
+struct ValueCodec<double> : FixedValueCodec<double, WireType::kFloat8> {};
 
-    static inline size_t SizeValue(T, SizeTape&) noexcept { return 8; }
-    static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, T v,
-                                                const uint32_t*&) noexcept {
-        return WriteFixedRaw<T>(dst, v);
-    }
-    static inline bool DecodeValue(FastReader& r, T& v) noexcept {
-        return r.ReadFixed<T>(v);
-    }
-    static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
-                                             T& v) noexcept {
-        return ReadFixedContiguous<T>(cur, end, v);
-    }
-};
-
-// Enums -> kFixed4 (int32_t underlying value)
+// Enums -> kSigned4 (int32_t underlying value, sign-extends to 64-bit per PB)
 template <typename T>
 struct ValueCodec<T, std::enable_if_t<std::is_enum_v<T>>> {
-    static constexpr WireType kWireType = WireType::kFixed4;
+    static constexpr WireType kWireType = WireType::kSigned4;
 
     static inline size_t SizeValue(T, SizeTape&) noexcept { return 4; }
     static inline uint8_t* EncodeValueUnchecked(uint8_t* dst, T v,
@@ -125,7 +133,7 @@ struct ValueCodec<T, std::enable_if_t<std::is_enum_v<T>>> {
         return true;
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              T& v) noexcept {
         int32_t raw = 0;
         if (!ReadFixedContiguous<int32_t>(cur, end, raw)) {
@@ -154,7 +162,7 @@ struct ValueCodec<std::string> {
         return r.ReadString(v);
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
-                                             const uint8_t* end, int,
+                                             const uint8_t* end, int, size_t*,
                                              std::string& v) {
         return ReadStringContiguous(cur, end, v);
     }
@@ -188,7 +196,8 @@ struct ValueCodec<T> {
         const uint8_t* span = nullptr;
         const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
         if (st == SpanReadStatus::kContiguous) [[likely]] {
-            return v.DecodeContiguous(span, span + len, r.RemainingDepth() - 1);
+            return v.DecodeContiguous(span, span + len, r.RemainingDepth() - 1,
+                                      r.ExpandedBudgetPtr());
         }
         if (st == SpanReadStatus::kError) {
             return false;
@@ -210,7 +219,8 @@ struct ValueCodec<T> {
         const uint8_t* span = nullptr;
         const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
         if (st == SpanReadStatus::kContiguous) [[likely]] {
-            FastReader sub(span, len, r.RemainingDepth() - 1);
+            FastReader sub(span, len, r.RemainingDepth() - 1,
+                           r.ExpandedBudgetPtr());
             return v.template DecodeLoop<false>(sub);
         }
         if (st == SpanReadStatus::kError) {
@@ -225,7 +235,7 @@ struct ValueCodec<T> {
 
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
                                              const uint8_t* end, int depth,
-                                             T& v) {
+                                             size_t* budget, T& v) {
         if (depth <= 0) [[unlikely]] {
             return false;
         }
@@ -238,7 +248,7 @@ struct ValueCodec<T> {
         }
         const uint8_t* sub_cur = cur;
         cur += len;
-        return v.DecodeContiguous(sub_cur, sub_cur + len, depth - 1);
+        return v.DecodeContiguous(sub_cur, sub_cur + len, depth - 1, budget);
     }
 };
 
@@ -272,8 +282,10 @@ struct ValueCodec<IndirectBox<T>> {
     }
     static inline bool DecodeValueContiguous(const uint8_t*& cur,
                                              const uint8_t* end, int depth,
+                                             size_t* budget,
                                              IndirectBox<T>& v) {
-        return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, v.get());
+        return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, budget,
+                                                    v.get());
     }
 };
 
@@ -320,23 +332,39 @@ inline constexpr bool kIsMessageOrBox =
 // Compile-time WireType deduction for any generated struct field type.
 template <typename T>
 consteval WireType FieldWireType() {
-    if constexpr (IsUnorderedMap<T>::value) {
-        return WireType::kList;
-    } else if constexpr (IsVector<T>::value) {
-        using E = typename T::value_type;
-        if constexpr (std::is_same_v<E, bool>) {
-            return WireType::kPacked1;
-        } else if constexpr (kIsBulkCopyableElement<E> && sizeof(E) == 4) {
-            return WireType::kPacked4;
-        } else if constexpr (kIsBulkCopyableElement<E> && sizeof(E) == 8) {
-            return WireType::kPacked8;
-        } else {
-            return WireType::kList;
-        }
+    if constexpr (IsUnorderedMap<T>::value || IsVector<T>::value) {
+        return WireType::kSeq;
     } else if constexpr (IsOptionalLike<T>::value) {
         return ValueCodec<typename T::value_type>::kWireType;
     } else {
         return ValueCodec<T>::kWireType;
+    }
+}
+
+// Compile-time canonical SeqKind deduction for repeated & map fields.
+template <typename T>
+consteval SeqKind FieldSeqKind() {
+    if constexpr (IsUnorderedMap<T>::value) {
+        return SeqKind::kBytesList;
+    } else {
+        static_assert(IsVector<T>::value);
+        using E = typename T::value_type;
+        if constexpr (std::is_same_v<E, bool>) {
+            return SeqKind::kBitBool;
+        } else if constexpr (std::is_same_v<E, int32_t> || std::is_enum_v<E>) {
+            return SeqKind::kSigned4;
+        } else if constexpr (std::is_same_v<E, uint32_t>) {
+            return SeqKind::kUnsigned4;
+        } else if constexpr (std::is_same_v<E, int64_t> ||
+                             std::is_same_v<E, uint64_t>) {
+            return SeqKind::kInt8;
+        } else if constexpr (std::is_same_v<E, float>) {
+            return SeqKind::kFloat4;
+        } else if constexpr (std::is_same_v<E, double>) {
+            return SeqKind::kFloat8;
+        } else {
+            return SeqKind::kBytesList;
+        }
     }
 }
 
@@ -452,11 +480,40 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
 
 namespace brpc_fast::detail {
 
+// ---- Constant-vector detection (O(1) fail-fast on varied vectors) ----
+
+template <typename E>
+inline bool IsConstEncodedVector(const std::vector<E>& v) noexcept {
+    constexpr size_t kMinElems = std::is_same_v<E, bool> ? 64u : 16u;
+    const size_t n = v.size();
+    if (n < kMinElems) return false;
+    if constexpr (std::is_same_v<E, bool>) {
+        if (n > kMaxExpandedSeqBytes) return false;
+        const bool first = v[0];
+        if (v[1] != first || v[n - 1] != first || v[n >> 1] != first) {
+            return false;
+        }
+        return std::find(v.begin() + 2, v.end() - 1, !first) == (v.end() - 1);
+    } else {
+        if (static_cast<uint64_t>(n) * sizeof(E) > kMaxExpandedSeqBytes) {
+            return false;
+        }
+        const E first = v[0];
+        if (!ScalarBitEqual(v[1], first) || !ScalarBitEqual(v[n - 1], first) ||
+            !ScalarBitEqual(v[n >> 1], first)) {
+            return false;
+        }
+        return std::all_of(v.begin() + 2, v.end() - 1,
+                           [first](E x) { return ScalarBitEqual(x, first); });
+    }
+}
+
 // ---- Repeated decode (unified Overwrite/Append templates) ----
 
 template <bool Overwrite, typename T>
 inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
-                                         int depth, std::vector<T>& vec) {
+                                         int depth, size_t* budget,
+                                         std::vector<T>& vec) {
     uint32_t count = 0;
     if (!ReadVarint32Contiguous(cur, end, count)) [[unlikely]] {
         return false;
@@ -500,7 +557,7 @@ inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
             T* dst = vec.data();
             for (size_t i = base; i < reuse_end; ++i) {
                 if (!ValueCodec<T>::DecodeValueContiguous(
-                        cur, end, depth, dst[i])) [[unlikely]] {
+                        cur, end, depth, budget, dst[i])) [[unlikely]] {
                     return false;
                 }
             }
@@ -510,7 +567,7 @@ inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
             for (size_t i = std::max(base, existing); i < target; ++i) {
                 vec.emplace_back();
                 if (!ValueCodec<T>::DecodeValueContiguous(
-                        cur, end, depth, vec.back())) [[unlikely]] {
+                        cur, end, depth, budget, vec.back())) [[unlikely]] {
                     return false;
                 }
             }
@@ -523,10 +580,11 @@ inline bool DecodeRepeatedBodyContiguous(const uint8_t* cur, const uint8_t* end,
     return cur == end;
 }
 
+// Decodes canonical SeqKind body (after tag + SeqKind already matched).
 template <bool Overwrite, typename T>
 inline bool DecodeRepeatedFieldContiguous(const uint8_t*& cur,
                                           const uint8_t* end, int depth,
-                                          std::vector<T>& vec) {
+                                          size_t* budget, std::vector<T>& vec) {
     if constexpr (kIsBulkCopyableElement<T>) {
         uint32_t byte_len = 0;
         if (!ReadVarint32Contiguous(cur, end, byte_len)) [[unlikely]] {
@@ -550,19 +608,15 @@ inline bool DecodeRepeatedFieldContiguous(const uint8_t*& cur,
         }
         return true;
     } else if constexpr (std::is_same_v<T, bool>) {
-        uint32_t count = 0;
-        if (!ReadVarint32Contiguous(cur, end, count)) [[unlikely]] {
+        uint32_t body_len = 0;
+        if (!ReadVarint32Contiguous(cur, end, body_len) ||
+            static_cast<size_t>(end - cur) < body_len) [[unlikely]] {
             return false;
         }
-        if (static_cast<size_t>(end - cur) < count) [[unlikely]] {
-            return false;
-        }
-        const size_t base = Overwrite ? 0 : vec.size();
-        vec.resize(base + count);
-        for (uint32_t i = 0; i < count; ++i) {
-            vec[base + i] = (*cur++ != 0);
-        }
-        return true;
+        const uint8_t* sub_cur = cur;
+        cur += body_len;
+        return DecodeBitBoolBodyContiguous<Overwrite>(
+            sub_cur, sub_cur + body_len, vec);
     } else {
         uint32_t body_len = 0;
         if (!ReadVarint32Contiguous(cur, end, body_len)) [[unlikely]] {
@@ -574,10 +628,77 @@ inline bool DecodeRepeatedFieldContiguous(const uint8_t*& cur,
         const uint8_t* sub_cur = cur;
         cur += body_len;
         return DecodeRepeatedBodyContiguous<Overwrite>(
-            sub_cur, sub_cur + body_len, depth, vec);
+            sub_cur, sub_cur + body_len, depth, budget, vec);
     }
 }
 
+template <bool Overwrite, typename T>
+inline bool DecodeConstRepeatedContiguous(const uint8_t*& cur,
+                                          const uint8_t* end, size_t* budget,
+                                          std::vector<T>& vec) {
+    uint32_t body_len = 0;
+    if (!ReadVarint32Contiguous(cur, end, body_len) ||
+        static_cast<size_t>(end - cur) < body_len) [[unlikely]] {
+        return false;
+    }
+    const uint8_t* p = cur;
+    const uint8_t* pend = cur + body_len;
+    cur += body_len;
+    uint32_t count = 0;
+    if (!ReadVarint32Contiguous(p, pend, count)) [[unlikely]] {
+        return false;
+    }
+    constexpr size_t kValBytes = std::is_same_v<T, bool> ? 1u : sizeof(T);
+    if (static_cast<size_t>(pend - p) != kValBytes) [[unlikely]] {
+        return false;
+    }
+    if (!ConsumeExpandedBudgetPtr(budget,
+                                  static_cast<uint64_t>(count) * kValBytes))
+        [[unlikely]] {
+        return false;
+    }
+    T val{};
+    if constexpr (std::is_same_v<T, bool>) {
+        val = (*p != 0);
+    } else if constexpr (std::is_enum_v<T>) {
+        int32_t raw = 0;
+        std::memcpy(&raw, p, 4);
+        val = static_cast<T>(LittleEndianToHost(raw));
+    } else {
+        T raw{};
+        std::memcpy(&raw, p, sizeof(T));
+        val = LittleEndianToHost(raw);
+    }
+    const size_t base = Overwrite ? 0 : vec.size();
+    vec.resize(base + count);
+    if constexpr (std::is_same_v<T, bool>) {
+        std::fill_n(vec.begin() + static_cast<std::ptrdiff_t>(base), count,
+                    val);
+    } else {
+        std::fill_n(vec.data() + base, count, val);
+    }
+    return true;
+}
+
+template <bool Overwrite, FastMessageLike T>
+inline bool DecodeColumnarContiguous(const uint8_t*& cur, const uint8_t* end,
+                                     int depth, size_t* budget,
+                                     std::vector<T>& vec) {
+    if (depth <= 0) [[unlikely]] {
+        return false;
+    }
+    uint32_t body_len = 0;
+    if (!ReadVarint32Contiguous(cur, end, body_len) ||
+        static_cast<size_t>(end - cur) < body_len) [[unlikely]] {
+        return false;
+    }
+    const uint8_t* sub_cur = cur;
+    cur += body_len;
+    FastReader sub(sub_cur, body_len, depth - 1, budget);
+    return T::template DecodeColumnarVec<Overwrite>(sub, vec);
+}
+
+// Decodes canonical SeqKind body from FastReader (after tag + SeqKind matched).
 template <bool Overwrite, typename T>
 inline bool DecodeRepeatedField(FastReader& r, std::vector<T>& vec) {
     if constexpr (kIsBulkCopyableElement<T>) {
@@ -604,30 +725,15 @@ inline bool DecodeRepeatedField(FastReader& r, std::vector<T>& vec) {
         }
         return true;
     } else if constexpr (std::is_same_v<T, bool>) {
-        uint32_t count = 0;
-        if (!r.ReadVarint32(count)) {
-            return false;
-        }
-        if (r.Remaining() < count) [[unlikely]] {
-            return false;
-        }
-        const size_t base = Overwrite ? 0 : vec.size();
-        vec.resize(base + count);
-        for (uint32_t i = 0; i < count; ++i) {
-            uint8_t b = 0;
-            if (!r.ReadU8(b)) {
-                return false;
-            }
-            vec[base + i] = (b != 0);
-        }
-        return true;
+        return DecodeBitBoolSeq<Overwrite>(r, vec);
     } else {
         uint32_t len = 0;
         const uint8_t* span = nullptr;
         const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
         if (st == SpanReadStatus::kContiguous) [[likely]] {
             return DecodeRepeatedBodyContiguous<Overwrite>(
-                span, span + len, r.RemainingDepth(), vec);
+                span, span + len, r.RemainingDepth(), r.ExpandedBudgetPtr(),
+                vec);
         }
         if (st == SpanReadStatus::kError) {
             return false;
@@ -725,7 +831,7 @@ BRPC_FAST_NOINLINE inline bool DecodeMapEntryLoop(
 
 template <typename K, typename V, typename H, typename E, typename A>
 inline bool DecodeMapEntryContiguous(const uint8_t* ecur, const uint8_t* eend,
-                                     int depth,
+                                     int depth, size_t* budget,
                                      std::unordered_map<K, V, H, E, A>& m) {
     const uint8_t* const orig_cur = ecur;
     K key{};
@@ -734,15 +840,15 @@ inline bool DecodeMapEntryContiguous(const uint8_t* ecur, const uint8_t* eend,
     constexpr uint32_t kValTag = MakeTag(2u, ValueCodec<V>::kWireType);
     if (ecur < eend && *ecur == static_cast<uint8_t>(kKeyTag)) {
         ++ecur;
-        if (!ValueCodec<K>::DecodeValueContiguous(ecur, eend, depth, key))
-            [[unlikely]] {
+        if (!ValueCodec<K>::DecodeValueContiguous(ecur, eend, depth, budget,
+                                                  key)) [[unlikely]] {
             return false;
         }
     }
     if (ecur < eend && *ecur == static_cast<uint8_t>(kValTag)) {
         ++ecur;
-        if (!ValueCodec<V>::DecodeValueContiguous(ecur, eend, depth, val))
-            [[unlikely]] {
+        if (!ValueCodec<V>::DecodeValueContiguous(ecur, eend, depth, budget,
+                                                  val)) [[unlikely]] {
             return false;
         }
     }
@@ -750,7 +856,8 @@ inline bool DecodeMapEntryContiguous(const uint8_t* ecur, const uint8_t* eend,
         m.insert_or_assign(std::move(key), std::move(val));
         return true;
     }
-    FastReader sub(orig_cur, static_cast<size_t>(eend - orig_cur), depth);
+    FastReader sub(orig_cur, static_cast<size_t>(eend - orig_cur), depth,
+                   budget);
     return DecodeMapEntryLoop(sub, m);
 }
 
@@ -762,7 +869,7 @@ inline bool DecodeMapSingleEntry(FastReader& r,
     const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
     if (st == SpanReadStatus::kContiguous) [[likely]] {
         return DecodeMapEntryContiguous(span, span + len, r.RemainingDepth(),
-                                        m);
+                                        r.ExpandedBudgetPtr(), m);
     }
     if (st == SpanReadStatus::kError) {
         return false;
@@ -776,7 +883,7 @@ inline bool DecodeMapSingleEntry(FastReader& r,
 
 template <typename K, typename V, typename H, typename E, typename A>
 inline bool DecodeMapBodyContiguous(const uint8_t* cur, const uint8_t* end,
-                                    int depth,
+                                    int depth, size_t* budget,
                                     std::unordered_map<K, V, H, E, A>& m) {
     uint32_t count = 0;
     if (!ReadVarint32Contiguous(cur, end, count)) [[unlikely]] {
@@ -794,7 +901,7 @@ inline bool DecodeMapBodyContiguous(const uint8_t* cur, const uint8_t* end,
         }
         const uint8_t* ecur = cur;
         cur += elen;
-        if (!DecodeMapEntryContiguous(ecur, ecur + elen, depth, m))
+        if (!DecodeMapEntryContiguous(ecur, ecur + elen, depth, budget, m))
             [[unlikely]] {
             return false;
         }
@@ -809,7 +916,8 @@ inline bool DecodeMapField(FastReader& r,
     const uint8_t* span = nullptr;
     const SpanReadStatus st = r.TryReadContiguousSpan(len, span);
     if (st == SpanReadStatus::kContiguous) [[likely]] {
-        return DecodeMapBodyContiguous(span, span + len, r.RemainingDepth(), m);
+        return DecodeMapBodyContiguous(span, span + len, r.RemainingDepth(),
+                                       r.ExpandedBudgetPtr(), m);
     }
     if (st == SpanReadStatus::kError) {
         return false;
@@ -834,6 +942,104 @@ inline bool DecodeMapField(FastReader& r,
     return sub.Eof();
 }
 
+// Decodes a kColumnar encoded repeated MapEntry into a map<K, V>, preserving
+// full map <-> repeated MapEntry compatibility even when the MapEntry struct
+// was columnar-encoded or when K/V evolved to an incompatible non-scalar type.
+template <typename K, typename V, typename H, typename E, typename A>
+BRPC_FAST_NOINLINE inline bool DecodeMapFromColumnar(
+    FastReader& r, std::unordered_map<K, V, H, E, A>& m) {
+    uint32_t body_len = 0;
+    if (!r.ReadVarint32(body_len)) return false;
+    FastReader sub(FastReader::kUninitialized);
+    if (!r.ReadSubReaderSlow(body_len, sub, /*check_depth=*/false)) {
+        return false;
+    }
+    uint32_t count = 0;
+    if (!sub.ReadVarint32(count)) return false;
+    constexpr size_t kKeyCost = kIsFixedScalarField<K> ? sizeof(K) : 0u;
+    constexpr size_t kValCost = kIsFixedScalarField<V> ? sizeof(V) : 0u;
+    // Account for temporary vectors plus unordered_map node/bucket overhead.
+    constexpr size_t kPerEntryCost = kKeyCost + kValCost + 48u;
+    if (!sub.ConsumeExpandedBudget(static_cast<uint64_t>(count) *
+                                   kPerEntryCost)) {
+        return false;
+    }
+    std::conditional_t<kIsFixedScalarField<K>, std::vector<K>, char> keys{};
+    std::conditional_t<kIsFixedScalarField<V>, std::vector<V>, char> vals{};
+    if constexpr (kIsFixedScalarField<K>) {
+        keys.resize(count);
+    }
+    if constexpr (kIsFixedScalarField<V>) {
+        vals.resize(count);
+    }
+    while (!sub.Eof()) {
+        uint32_t tag = 0;
+        if (!sub.ReadTag(tag)) return false;
+        const uint32_t fn = TagFieldNumber(tag);
+        const WireType wt = TagWireType(tag);
+        if (fn == 0u) return false;
+        if (wt != WireType::kSeq) {
+            if (!sub.SkipUnknownField(wt)) return false;
+            continue;
+        }
+        uint8_t raw_kind = 0;
+        if (!sub.ReadU8(raw_kind)) return false;
+        const SeqKind kind = static_cast<SeqKind>(raw_kind);
+        if (fn == 1u) {
+            if constexpr (kIsFixedScalarField<K>) {
+                const CompatStatus st = ReadScalarColumn<K>(
+                    sub, kind, count,
+                    [&](uint32_t i, K k, bool) { keys[i] = k; });
+                if (st == CompatStatus::kError) return false;
+                if (st == CompatStatus::kIncompatible && !sub.SkipSeqBody()) {
+                    return false;
+                }
+            } else {
+                if (!sub.SkipSeqBody()) return false;
+            }
+        } else if (fn == 2u) {
+            if constexpr (kIsFixedScalarField<V>) {
+                const CompatStatus st = ReadScalarColumn<V>(
+                    sub, kind, count,
+                    [&](uint32_t i, V v, bool) { vals[i] = v; });
+                if (st == CompatStatus::kError) return false;
+                if (st == CompatStatus::kIncompatible && !sub.SkipSeqBody()) {
+                    return false;
+                }
+            } else {
+                if (!sub.SkipSeqBody()) return false;
+            }
+        } else {
+            if (!sub.SkipSeqBody()) return false;
+        }
+    }
+    if (count == 0) {
+        return true;
+    }
+    if constexpr (!kIsFixedScalarField<K>) {
+        if constexpr (kIsFixedScalarField<V>) {
+            m.insert_or_assign(K{}, static_cast<V>(vals[count - 1]));
+        } else {
+            m.insert_or_assign(K{}, V{});
+        }
+    } else {
+        if constexpr (std::is_same_v<K, bool>) {
+            m.reserve(std::min<size_t>(m.size() + count, 2u));
+        } else {
+            m.reserve(m.size() + count);
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if constexpr (kIsFixedScalarField<V>) {
+                m.insert_or_assign(static_cast<K>(keys[i]),
+                                   static_cast<V>(vals[i]));
+            } else {
+                m.insert_or_assign(static_cast<K>(keys[i]), V{});
+            }
+        }
+    }
+    return true;
+}
+
 // ---- Unified type-dispatched FieldCodec entry points for codegen ----
 
 template <uint32_t FieldNumber, bool OmitProto3Default, typename T>
@@ -853,28 +1059,61 @@ inline size_t SizeField(const T& v, SizeTape& tape) {
                 Varint32Size(static_cast<uint32_t>(entry_len)) + entry_len;
         }
         tape.Set(body_slot, static_cast<uint32_t>(body_len));
-        return TagSize(FieldNumber, WireType::kList) +
+        return SeqHeaderSize(FieldNumber) +
                Varint32Size(static_cast<uint32_t>(body_len)) + body_len;
     } else if constexpr (IsVector<T>::value) {
         if (v.empty()) return 0;
         using E = typename T::value_type;
-        constexpr WireType kWt = FieldWireType<T>();
-        constexpr size_t tag_sz = TagSize(FieldNumber, kWt);
+        constexpr size_t hdr_sz = SeqHeaderSize(FieldNumber);
         if constexpr (kIsBulkCopyableElement<E>) {
+            if (IsConstEncodedVector(v)) [[unlikely]] {
+                const uint32_t body_len =
+                    Varint32Size(static_cast<uint32_t>(v.size())) +
+                    static_cast<uint32_t>(sizeof(E));
+                return hdr_sz + Varint32Size(body_len) + body_len;
+            }
             const size_t byte_len = v.size() * sizeof(E);
-            return tag_sz + Varint32Size(static_cast<uint32_t>(byte_len)) +
+            return hdr_sz + Varint32Size(static_cast<uint32_t>(byte_len)) +
                    byte_len;
         } else if constexpr (std::is_same_v<E, bool>) {
-            const size_t n = v.size();
-            return tag_sz + Varint32Size(static_cast<uint32_t>(n)) + n;
+            const size_t n_sz = v.size();
+            if (n_sz > std::numeric_limits<uint32_t>::max()) [[unlikely]] {
+                return static_cast<size_t>(std::numeric_limits<int32_t>::max()) +
+                       1u;
+            }
+            const uint32_t n = static_cast<uint32_t>(n_sz);
+            if (IsConstEncodedVector(v)) [[unlikely]] {
+                const size_t body_len =
+                    static_cast<size_t>(Varint32Size(n)) + 1u;
+                return hdr_sz + Varint32Size(static_cast<uint32_t>(body_len)) +
+                       body_len;
+            }
+            const size_t byte_cnt = (n_sz + 7u) >> 3;
+            const size_t body_len =
+                static_cast<size_t>(Varint32Size(n)) + byte_cnt;
+            return hdr_sz + Varint32Size(static_cast<uint32_t>(body_len)) +
+                   body_len;
         } else {
+            if constexpr (FastMessageLike<E>) {
+                if constexpr (E::kIsColumnarEligible) {
+                    if (v.size() >= kColumnarMinElements &&
+                        static_cast<uint64_t>(v.size()) * sizeof(E) <=
+                            kMaxExpandedSeqBytes) {
+                        const size_t body_len = E::ComputeColumnarSize(
+                            v.data(), static_cast<uint32_t>(v.size()), tape);
+                        return hdr_sz +
+                               Varint32Size(static_cast<uint32_t>(body_len)) +
+                               body_len;
+                    }
+                }
+            }
             const size_t slot = tape.Reserve();
             size_t body_len = Varint32Size(static_cast<uint32_t>(v.size()));
             for (const auto& elem : v) {
                 body_len += ValueCodec<E>::SizeValue(elem, tape);
             }
             tape.Set(slot, static_cast<uint32_t>(body_len));
-            return tag_sz + Varint32Size(static_cast<uint32_t>(body_len)) +
+            return hdr_sz + Varint32Size(static_cast<uint32_t>(body_len)) +
                    body_len;
         }
     } else if constexpr (IsOptionalLike<T>::value) {
@@ -897,7 +1136,7 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
     if constexpr (IsUnorderedMap<T>::value) {
         if (v.empty()) return dst;
         using V = typename T::mapped_type;
-        dst = WriteConstTag<FieldNumber, WireType::kList>(dst);
+        dst = WriteConstSeqHeader<FieldNumber, SeqKind::kBytesList>(dst);
         const uint32_t body_len = *tape++;
         dst = WriteVarint32Raw(dst, body_len);
         dst = WriteVarint32Raw(dst, static_cast<uint32_t>(v.size()));
@@ -911,9 +1150,22 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
     } else if constexpr (IsVector<T>::value) {
         if (v.empty()) return dst;
         using E = typename T::value_type;
-        constexpr WireType kWt = FieldWireType<T>();
-        dst = WriteConstTag<FieldNumber, kWt>(dst);
         if constexpr (kIsBulkCopyableElement<E>) {
+            if (IsConstEncodedVector(v)) [[unlikely]] {
+                constexpr SeqKind kConstKind = ConstSeqKindFor<E>();
+                const uint32_t n = static_cast<uint32_t>(v.size());
+                dst = WriteConstSeqHeader<FieldNumber, kConstKind>(dst);
+                dst = WriteVarint32Raw(
+                    dst, Varint32Size(n) + static_cast<uint32_t>(sizeof(E)));
+                dst = WriteVarint32Raw(dst, n);
+                if constexpr (std::is_enum_v<E>) {
+                    return WriteFixedRaw<int32_t>(dst,
+                                                  static_cast<int32_t>(v[0]));
+                } else {
+                    return WriteFixedRaw<E>(dst, v[0]);
+                }
+            }
+            dst = WriteConstSeqHeader<FieldNumber, FieldSeqKind<T>()>(dst);
             if constexpr (std::endian::native == std::endian::little) {
                 return WriteLengthPrefixedBytesRaw(dst, v.data(),
                                                    v.size() * sizeof(E));
@@ -922,18 +1174,63 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
                     static_cast<uint32_t>(v.size() * sizeof(E));
                 dst = WriteVarint32Raw(dst, byte_len);
                 for (const E& elem : v) {
-                    dst = WriteFixedRaw<E>(dst, elem);
+                    if constexpr (std::is_enum_v<E>) {
+                        dst = WriteFixedRaw<int32_t>(
+                            dst, static_cast<int32_t>(elem));
+                    } else {
+                        dst = WriteFixedRaw<E>(dst, elem);
+                    }
                 }
                 return dst;
             }
         } else if constexpr (std::is_same_v<E, bool>) {
-            const uint32_t n = static_cast<uint32_t>(v.size());
+            const size_t n_sz = v.size();
+            const uint32_t n = static_cast<uint32_t>(n_sz);
+            if (IsConstEncodedVector(v)) [[unlikely]] {
+                dst =
+                    WriteConstSeqHeader<FieldNumber, SeqKind::kConstBool>(dst);
+                dst = WriteVarint32Raw(dst, Varint32Size(n) + 1u);
+                dst = WriteVarint32Raw(dst, n);
+                *dst++ = v[0] ? 1 : 0;
+                return dst;
+            }
+            dst = WriteConstSeqHeader<FieldNumber, SeqKind::kBitBool>(dst);
+            const size_t byte_cnt = (n_sz + 7u) >> 3;
+            dst = WriteVarint32Raw(
+                dst, static_cast<uint32_t>(Varint32Size(n) + byte_cnt));
             dst = WriteVarint32Raw(dst, n);
-            for (uint32_t i = 0; i < n; ++i) {
-                *dst++ = v[i] ? 1 : 0;
+            size_t i = 0;
+            for (; i + 8 <= n_sz; i += 8) {
+                const uint8_t byte = static_cast<uint8_t>(
+                    (v[i] ? 1u : 0u) | ((v[i + 1] ? 1u : 0u) << 1) |
+                    ((v[i + 2] ? 1u : 0u) << 2) | ((v[i + 3] ? 1u : 0u) << 3) |
+                    ((v[i + 4] ? 1u : 0u) << 4) | ((v[i + 5] ? 1u : 0u) << 5) |
+                    ((v[i + 6] ? 1u : 0u) << 6) | ((v[i + 7] ? 1u : 0u) << 7));
+                *dst++ = byte;
+            }
+            if (i < n_sz) {
+                uint8_t byte = 0;
+                for (uint32_t bit = 0; i < n_sz; ++i, ++bit) {
+                    if (v[i]) byte |= static_cast<uint8_t>(1u << bit);
+                }
+                *dst++ = byte;
             }
             return dst;
         } else {
+            if constexpr (FastMessageLike<E>) {
+                if constexpr (E::kIsColumnarEligible) {
+                    if (v.size() >= kColumnarMinElements &&
+                        static_cast<uint64_t>(v.size()) * sizeof(E) <=
+                            kMaxExpandedSeqBytes) {
+                        dst = WriteConstSeqHeader<FieldNumber,
+                                                  SeqKind::kColumnar>(dst);
+                        return E::EncodeColumnarUnchecked(
+                            dst, v.data(), static_cast<uint32_t>(v.size()),
+                            tape);
+                    }
+                }
+            }
+            dst = WriteConstSeqHeader<FieldNumber, SeqKind::kBytesList>(dst);
             const uint32_t body_len = *tape++;
             dst = WriteVarint32Raw(dst, body_len);
             dst = WriteVarint32Raw(dst, static_cast<uint32_t>(v.size()));
@@ -956,39 +1253,79 @@ inline uint8_t* EncodeFieldUnchecked(uint8_t* dst, const T& v,
     }
 }
 
-template <typename T>
-inline bool DecodeFieldContiguous(const uint8_t*& cur, const uint8_t* end,
-                                  int depth, T& field) {
+// Fast-path contiguous field matcher & decoder invoked by generated
+// DecodeContiguous(). Handles 1- or 2-byte tags and (for kSeq) fused
+// tag+SeqKind matching without falling back to DecodeLoop.
+template <uint32_t FieldNumber, typename T>
+inline bool TryDecodeFieldContiguous(const uint8_t*& cur, const uint8_t* end,
+                                     int depth, size_t* budget, T& field) {
     if constexpr (IsUnorderedMap<T>::value) {
-        uint32_t body_len = 0;
-        if (!ReadVarint32Contiguous(cur, end, body_len) ||
-            static_cast<size_t>(end - cur) < body_len) [[unlikely]] {
-            return false;
+        if (MatchConstSeqHeader<FieldNumber, SeqKind::kBytesList>(cur, end)) {
+            uint32_t body_len = 0;
+            if (!ReadVarint32Contiguous(cur, end, body_len) ||
+                static_cast<size_t>(end - cur) < body_len) [[unlikely]] {
+                return false;
+            }
+            const uint8_t* sub_cur = cur;
+            cur += body_len;
+            ClearMap(field);
+            return DecodeMapBodyContiguous(sub_cur, sub_cur + body_len, depth,
+                                           budget, field);
         }
-        const uint8_t* sub_cur = cur;
-        cur += body_len;
         ClearMap(field);
-        return DecodeMapBodyContiguous(sub_cur, sub_cur + body_len, depth,
-                                       field);
+        return true;
     } else if constexpr (IsVector<T>::value) {
-        return DecodeRepeatedFieldContiguous<true>(cur, end, depth, field);
-    } else if constexpr (IsOptionalLike<T>::value) {
-        if (!field.has_value()) {
-            field.emplace();
+        using E = typename T::value_type;
+        if constexpr (FastMessageLike<E>) {
+            if constexpr (E::kIsColumnarEligible) {
+                if (MatchConstSeqHeader<FieldNumber, SeqKind::kColumnar>(cur,
+                                                                         end)) {
+                    return DecodeColumnarContiguous<true>(cur, end, depth,
+                                                          budget, field);
+                }
+            }
         }
-        return ValueCodec<typename T::value_type>::DecodeValueContiguous(
-            cur, end, depth, *field);
+        if (MatchConstSeqHeader<FieldNumber, FieldSeqKind<T>()>(cur, end)) {
+            return DecodeRepeatedFieldContiguous<true>(cur, end, depth, budget,
+                                                       field);
+        }
+        if constexpr (kIsFixedScalarField<E>) {
+            if (MatchConstSeqHeader<FieldNumber, ConstSeqKindFor<E>()>(cur,
+                                                                       end)) {
+                return DecodeConstRepeatedContiguous<true>(cur, end, budget,
+                                                           field);
+            }
+        }
+        ClearVector(field);
+        return true;
+    } else if constexpr (IsOptionalLike<T>::value) {
+        if (MatchConstTag<kFieldTag<FieldNumber, T>>(cur, end)) {
+            if (!field.has_value()) {
+                field.emplace();
+            }
+            return ValueCodec<typename T::value_type>::DecodeValueContiguous(
+                cur, end, depth, budget, *field);
+        }
+        field.reset();
+        return true;
     } else {
-        return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, field);
+        if (MatchConstTag<kFieldTag<FieldNumber, T>>(cur, end)) {
+            return ValueCodec<T>::DecodeValueContiguous(cur, end, depth, budget,
+                                                        field);
+        }
+        ResetField(field);
+        return true;
     }
 }
 
 // Unified field decoder for DecodeLoop<Overwrite>.
-// - Exact WireType match takes the fast path (reusing heap buffers on first
-//   occurrence in Overwrite mode; merging duplicate submessages).
-// - Compatible schema-evolution WireTypes convert cleanly on the slow path.
-// - Genuinely incompatible WireTypes are skipped (or captured into `unknown`
-//   when --preserve_unknown_fields is enabled).
+// - Exact WireType (+ canonical SeqKind for kSeq) takes the fast path (reusing
+//   heap buffers on first occurrence in Overwrite mode; merging duplicate
+//   submessages).
+// - Compatible schema-evolution WireTypes / SeqKinds convert cleanly on the
+//   slow path with exact Proto3 signedness and float/int isolation.
+// - Genuinely incompatible WireTypes / SeqKinds are skipped (or captured into
+//   `unknown` when --preserve_unknown_fields is enabled).
 template <bool Overwrite, typename T>
 inline bool DecodeFieldInLoop(FastReader& r, uint32_t tag, WireType wt,
                               T& field, uint64_t& seen_mask, int bit_idx,
@@ -1017,9 +1354,19 @@ inline bool DecodeFieldInLoop(FastReader& r, uint32_t tag, WireType wt,
     };
 
     if constexpr (IsUnorderedMap<T>::value) {
-        if (wt == WireType::kList) [[likely]] {
-            if (mark_first_seen()) ClearMap(field);
-            return DecodeMapField(r, field);
+        if (wt == WireType::kSeq) [[likely]] {
+            uint8_t raw_kind = 0;
+            if (!r.ReadU8(raw_kind)) return false;
+            if (static_cast<SeqKind>(raw_kind) == SeqKind::kBytesList)
+                [[likely]] {
+                if (mark_first_seen()) ClearMap(field);
+                return DecodeMapField(r, field);
+            }
+            if (static_cast<SeqKind>(raw_kind) == SeqKind::kColumnar) {
+                if (mark_first_seen()) ClearMap(field);
+                return DecodeMapFromColumnar(r, field);
+            }
+            return r.CaptureUnknownSeqField(tag, raw_kind, unknown);
         }
         if (wt == WireType::kBytes) {
             if (mark_first_seen()) ClearMap(field);
@@ -1027,13 +1374,28 @@ inline bool DecodeFieldInLoop(FastReader& r, uint32_t tag, WireType wt,
         }
         return r.CaptureUnknownField(tag, wt, unknown);
     } else if constexpr (IsVector<T>::value) {
-        if (wt == FieldWireType<T>()) [[likely]] {
-            return mark_first_seen() ? DecodeRepeatedField<true>(r, field)
-                                     : DecodeRepeatedField<false>(r, field);
+        if (wt == WireType::kSeq) [[likely]] {
+            uint8_t raw_kind = 0;
+            if (!r.ReadU8(raw_kind)) return false;
+            if (static_cast<SeqKind>(raw_kind) == FieldSeqKind<T>())
+                [[likely]] {
+                return mark_first_seen() ? DecodeRepeatedField<true>(r, field)
+                                         : DecodeRepeatedField<false>(r, field);
+            }
+            const bool first = Overwrite && !is_seen();
+            const CompatStatus st = DecodeRepeatedFromSeqCompat<Overwrite>(
+                r, raw_kind, field, first);
+            if (st == CompatStatus::kDecoded) {
+                mark_seen();
+                return true;
+            }
+            return st == CompatStatus::kIncompatible
+                       ? r.CaptureUnknownSeqField(tag, raw_kind, unknown)
+                       : false;
         }
         const bool first = Overwrite && !is_seen();
         const CompatStatus st =
-            DecodeRepeatedCompatSlow<Overwrite>(r, wt, field, first);
+            DecodeRepeatedFromNonSeqCompat<Overwrite>(r, wt, field, first);
         if (st == CompatStatus::kDecoded) {
             mark_seen();
             return true;
@@ -1055,31 +1417,60 @@ inline bool DecodeFieldInLoop(FastReader& r, uint32_t tag, WireType wt,
                 return ValueCodec<U>::DecodeValue(r, *field);
             }
         }
-        if constexpr (FastMessageLike<U>) {
-            if (wt != WireType::kList) {
-                return r.CaptureUnknownField(tag, wt, unknown);
-            }
-            const CompatStatus st =
-                DecodeMessageListMerge<U>(r, [&]() -> std::pair<U&, bool> {
+        if (wt == WireType::kSeq) {
+            uint8_t raw_kind = 0;
+            if (!r.ReadU8(raw_kind)) return false;
+            if constexpr (FastMessageLike<U>) {
+                const SeqKind kind = static_cast<SeqKind>(raw_kind);
+                CompatStatus st = CompatStatus::kIncompatible;
+                if (kind == SeqKind::kBytesList) {
+                    st = DecodeMessageListMerge<U>(
+                        r, [&]() -> std::pair<U&, bool> {
+                            mark_seen();
+                            if (!field.has_value()) field.emplace();
+                            return {*field, already_present};
+                        });
+                } else if (kind == SeqKind::kColumnar) {
+                    st = DecodeMessageColumnarMerge<U>(
+                        r, [&]() -> std::pair<U&, bool> {
+                            mark_seen();
+                            if (!field.has_value()) field.emplace();
+                            return {*field, already_present};
+                        });
+                }
+                if (st == CompatStatus::kDecoded || st == CompatStatus::kEmpty)
+                    return true;
+                return st == CompatStatus::kIncompatible
+                           ? r.CaptureUnknownSeqField(tag, raw_kind, unknown)
+                           : false;
+            } else {
+                U tmp{};
+                const CompatStatus st =
+                    DecodeSingularFromSeq<U>(r, raw_kind, tmp, false);
+                if (st == CompatStatus::kDecoded) {
                     mark_seen();
-                    if (!field.has_value()) field.emplace();
-                    return {*field, already_present};
-                });
-            return st == CompatStatus::kDecoded || st == CompatStatus::kEmpty;
-        } else {
+                    field = std::move(tmp);
+                    return true;
+                }
+                if (st == CompatStatus::kEmpty) return true;
+                return st == CompatStatus::kIncompatible
+                           ? r.CaptureUnknownSeqField(tag, raw_kind, unknown)
+                           : false;
+            }
+        }
+        if constexpr (!FastMessageLike<U>) {
             U tmp{};
-            const CompatStatus st =
-                DecodeSingularCompatSlow<U>(r, wt, tmp, false);
+            const CompatStatus st = DecodeSingularNonSeqCompat<U>(r, wt, tmp);
             if (st == CompatStatus::kDecoded) {
                 mark_seen();
                 field = std::move(tmp);
                 return true;
             }
-            if (st == CompatStatus::kEmpty) return true;
             return st == CompatStatus::kIncompatible
                        ? r.CaptureUnknownField(tag, wt, unknown)
                        : false;
         }
+        return r.CaptureUnknownField(tag, wt, unknown);
     } else {
         const bool already_present = is_seen();
         if (wt == ValueCodec<T>::kWireType) [[likely]] {
@@ -1092,13 +1483,25 @@ inline bool DecodeFieldInLoop(FastReader& r, uint32_t tag, WireType wt,
                 return ValueCodec<T>::DecodeValue(r, field);
             }
         }
-        const CompatStatus st =
-            DecodeSingularCompatSlow<T>(r, wt, field, already_present);
+        if (wt == WireType::kSeq) {
+            uint8_t raw_kind = 0;
+            if (!r.ReadU8(raw_kind)) return false;
+            const CompatStatus st =
+                DecodeSingularFromSeq<T>(r, raw_kind, field, already_present);
+            if (st == CompatStatus::kDecoded) {
+                mark_seen();
+                return true;
+            }
+            if (st == CompatStatus::kEmpty) return true;
+            return st == CompatStatus::kIncompatible
+                       ? r.CaptureUnknownSeqField(tag, raw_kind, unknown)
+                       : false;
+        }
+        const CompatStatus st = DecodeSingularNonSeqCompat<T>(r, wt, field);
         if (st == CompatStatus::kDecoded) {
             mark_seen();
             return true;
         }
-        if (st == CompatStatus::kEmpty) return true;
         return st == CompatStatus::kIncompatible
                    ? r.CaptureUnknownField(tag, wt, unknown)
                    : false;
@@ -1136,31 +1539,65 @@ inline bool DecodeOneofBranchInLoop(FastReader& r, uint32_t tag, WireType wt,
             return ValueCodec<BranchT>::DecodeValue(r, std::get<VariantIdx>(v));
         }
     }
-    if constexpr (kIsMessageOrBox<BranchT>) {
-        if (wt != WireType::kList) {
-            return r.CaptureUnknownField(tag, wt, unknown);
-        }
-        const CompatStatus st = DecodeMessageListMerge<BranchT>(
-            r, [&]() -> std::pair<BranchT&, bool> {
+    if (wt == WireType::kSeq) {
+        uint8_t raw_kind = 0;
+        if (!r.ReadU8(raw_kind)) return false;
+        if constexpr (kIsMessageOrBox<BranchT>) {
+            const SeqKind kind = static_cast<SeqKind>(raw_kind);
+            CompatStatus st = CompatStatus::kIncompatible;
+            if (kind == SeqKind::kBytesList) {
+                st = DecodeMessageListMerge<BranchT>(
+                    r, [&]() -> std::pair<BranchT&, bool> {
+                        mark_oneof_seen();
+                        if (v.index() != VariantIdx) {
+                            v.template emplace<VariantIdx>();
+                        }
+                        return {std::get<VariantIdx>(v), same_active};
+                    });
+            } else if (kind == SeqKind::kColumnar) {
+                st = DecodeMessageColumnarMerge<BranchT>(
+                    r, [&]() -> std::pair<BranchT&, bool> {
+                        mark_oneof_seen();
+                        if (v.index() != VariantIdx) {
+                            v.template emplace<VariantIdx>();
+                        }
+                        return {std::get<VariantIdx>(v), same_active};
+                    });
+            }
+            if (st == CompatStatus::kDecoded || st == CompatStatus::kEmpty) {
+                return true;
+            }
+            return st == CompatStatus::kIncompatible
+                       ? r.CaptureUnknownSeqField(tag, raw_kind, unknown)
+                       : false;
+        } else {
+            BranchT tmp{};
+            const CompatStatus st =
+                DecodeSingularFromSeq<BranchT>(r, raw_kind, tmp, false);
+            if (st == CompatStatus::kDecoded) {
                 mark_oneof_seen();
-                if (v.index() != VariantIdx) v.template emplace<VariantIdx>();
-                return {std::get<VariantIdx>(v), same_active};
-            });
-        return st == CompatStatus::kDecoded || st == CompatStatus::kEmpty;
-    } else {
+                v.template emplace<VariantIdx>(std::move(tmp));
+                return true;
+            }
+            if (st == CompatStatus::kEmpty) return true;
+            return st == CompatStatus::kIncompatible
+                       ? r.CaptureUnknownSeqField(tag, raw_kind, unknown)
+                       : false;
+        }
+    }
+    if constexpr (!kIsMessageOrBox<BranchT>) {
         BranchT tmp{};
-        const CompatStatus st =
-            DecodeSingularCompatSlow<BranchT>(r, wt, tmp, false);
+        const CompatStatus st = DecodeSingularNonSeqCompat<BranchT>(r, wt, tmp);
         if (st == CompatStatus::kDecoded) {
             mark_oneof_seen();
             v.template emplace<VariantIdx>(std::move(tmp));
             return true;
         }
-        if (st == CompatStatus::kEmpty) return true;
         return st == CompatStatus::kIncompatible
                    ? r.CaptureUnknownField(tag, wt, unknown)
                    : false;
     }
+    return r.CaptureUnknownField(tag, wt, unknown);
 }
 
 }  // namespace brpc_fast::detail

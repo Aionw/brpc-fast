@@ -26,6 +26,18 @@ static_assert(std::endian::native == std::endian::little ||
                   std::endian::native == std::endian::big,
               "brpc_fast does not support mixed-endian architectures");
 
+inline constexpr uint16_t ByteSwap16(uint16_t v) noexcept {
+#if defined(__cpp_lib_byteswap) && __cpp_lib_byteswap >= 202110L
+    return std::byteswap(v);
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_bswap16(v);
+#elif defined(_MSC_VER)
+    return _byteswap_ushort(v);
+#else
+    return static_cast<uint16_t>((v << 8) | (v >> 8));
+#endif
+}
+
 inline constexpr uint32_t ByteSwap32(uint32_t v) noexcept {
 #if defined(__cpp_lib_byteswap) && __cpp_lib_byteswap >= 202110L
     return std::byteswap(v);
@@ -60,10 +72,13 @@ inline constexpr uint64_t ByteSwap64(uint64_t v) noexcept {
 
 template <typename T>
 inline T ByteSwapFixed(T v) noexcept {
-    static_assert(sizeof(T) == 1 || sizeof(T) == 4 || sizeof(T) == 8,
-                  "ByteSwapFixed supports 1-, 4-, or 8-byte values");
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+                      sizeof(T) == 8,
+                  "ByteSwapFixed supports 1-, 2-, 4-, or 8-byte values");
     if constexpr (sizeof(T) == 1) {
         return v;
+    } else if constexpr (sizeof(T) == 2) {
+        return std::bit_cast<T>(ByteSwap16(std::bit_cast<uint16_t>(v)));
     } else if constexpr (sizeof(T) == 4) {
         return std::bit_cast<T>(ByteSwap32(std::bit_cast<uint32_t>(v)));
     } else {
